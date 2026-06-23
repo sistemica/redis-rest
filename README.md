@@ -45,6 +45,9 @@ HTTP 200 OK
 Key 'mykey' set successfully
 ```
 
+**Errors**: `400 Bad Request` if `expiration` is not a non-negative integer;
+`413 Request Entity Too Large` if the body exceeds `MAX_BODY_BYTES`.
+
 ---
 
 ### **2. Get Key**
@@ -66,6 +69,8 @@ HTTP 200 OK
 This is my raw value
 ```
 
+**Errors**: `404 Not Found` if the key does not exist.
+
 ---
 
 ### **3. Delete Key**
@@ -86,6 +91,8 @@ curl -X DELETE "http://localhost:8081/mykey"
 HTTP 200 OK
 Key 'mykey' deleted successfully
 ```
+
+**Errors**: `404 Not Found` if the key does not exist.
 
 ---
 
@@ -158,8 +165,9 @@ MAX_BODY_BYTES=1048576
 
 ## **Authentication**
 
-When `API_TOKEN` is set, every request to the key endpoints (`GET`/`POST`/`DELETE /:key`)
-must include a matching bearer token:
+When `API_TOKEN` is set, every request to the string and hash endpoints
+(`GET`/`POST`/`DELETE` on `/:key` and `/:key/:field`) must include a matching
+bearer token:
 
 ```bash
 curl -H "Authorization: Bearer $API_TOKEN" "http://localhost:8081/mykey"
@@ -264,12 +272,14 @@ docker run -d \
 ### **Directory Structure**
 ```
 .
-├── main.go         # Application entry point
-├── main_test.go    # Unit tests (run with `go test ./...`)
-├── go.mod          # Go module definition
-├── go.sum          # Dependencies checksum
-├── Dockerfile      # Dockerfile for containerization
-└── .env            # Environment variables (not committed to Git)
+├── main.go                 # Application entry point
+├── main_test.go            # Unit tests (run with `go test ./...`)
+├── go.mod                  # Go module definition
+├── go.sum                  # Dependencies checksum
+├── Dockerfile              # Dockerfile for containerization
+├── e2e/                    # End-to-end test stack (docker compose + run.sh)
+├── .github/workflows/      # CI: test, e2e, build & publish image
+└── .env                    # Environment variables (not committed to Git)
 ```
 
 ### **Running Tests**
@@ -318,7 +328,7 @@ HOST_PORT=18081 ./e2e/run.sh            # if 8081 is taken
 
 ### **Additional Features**
 - **Additional Redis Commands**:
-  - Support for more commands like `EXISTS`, `INCR`, `HGET`, etc.
+  - Support for more commands like `EXISTS`, `INCR`, `HGETALL`, etc.
 - **Monitoring**:
   - Integrate with monitoring tools like Prometheus for metrics.
 - **WebSocket Support**:

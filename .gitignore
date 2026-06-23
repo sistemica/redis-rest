@@ -25,7 +25,7 @@ go.work.sum
 .env
 
 # compiled binaries
-/restredis
+/redis-rest
 /redis-rest-api
 
 node_modules/

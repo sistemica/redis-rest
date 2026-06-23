@@ -1,6 +1,6 @@
-# **RestRedis**
+# **redis-rest**
 
-`RestRedis` is a lightweight REST API application that acts as a bridge to interact with a Redis database. It allows clients to perform basic Redis operations (e.g., `GET`, `SET`, `DELETE`) via simple HTTP requests. This is particularly useful for scenarios where RESTful communication is needed to interact with Redis.
+`redis-rest` is a lightweight REST API application that acts as a bridge to interact with a Redis database. It allows clients to perform basic Redis operations (e.g., `GET`, `SET`, `DELETE`) via simple HTTP requests. This is particularly useful for scenarios where RESTful communication is needed to interact with Redis.
 
 ---
 

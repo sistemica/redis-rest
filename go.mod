@@ -1,4 +1,4 @@
-module sistemica/restredis
+module github.com/sistemica/redis-rest
 
 go 1.22.2
 

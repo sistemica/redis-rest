@@ -66,8 +66,14 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}
+          # Canonical name plus the legacy alias (the repo was renamed from
+          # `restredis` to `redis-rest`). The alias keeps existing
+          # `:latest` pullers working and is deprecated — see the README.
+          images: |
+            ghcr.io/${{ github.repository }}
+            ghcr.io/sistemica/restredis/restredis
           tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
             type=semver,pattern={{version}}
             type=sha

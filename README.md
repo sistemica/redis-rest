@@ -185,8 +185,8 @@ otherwise. Useful for container/orchestrator liveness and readiness probes.
 ### **1. Using Go Directly**
 1. **Clone the repository**:
    ```bash
-   git clone https://github.com/sistemica/restredis.git
-   cd restredis
+   git clone https://github.com/sistemica/redis-rest.git
+   cd redis-rest
    ```
 
 2. **Install dependencies**:
@@ -205,18 +205,31 @@ otherwise. Useful for container/orchestrator liveness and readiness probes.
 
 ### **2. Using Docker**
 
+#### **Pulling the Pre-built Image (GHCR)**
+The canonical image is published to GitHub Container Registry:
+```bash
+docker pull ghcr.io/sistemica/redis-rest:latest
+```
+Available tags: `latest`, `main`, version tags (e.g. `v1.0.0`), and `sha-<commit>`.
+
+> **Deprecated:** the image was previously published as
+> `ghcr.io/sistemica/restredis/restredis` (back when this repo was named
+> `restredis`). That name is still updated as an alias for backward
+> compatibility but is **deprecated** — please switch to
+> `ghcr.io/sistemica/redis-rest`.
+
 #### **Building the Docker Image**
 ```bash
-docker build -t restredis .
+docker build -t redis-rest .
 ```
 
 #### **Running the Container**
 ```bash
 docker run -d \
-  --name restredis \
+  --name redis-rest \
   --env-file .env \
   -p 8081:8081 \
-  restredis
+  redis-rest
 ```
 
 #### **Connecting to Redis**
@@ -230,11 +243,11 @@ docker run -d \
     redis:latest
 
   docker run -d \
-    --name restredis \
+    --name redis-rest \
     --env-file .env \
     --network app-network \
     -p 8081:8081 \
-    restredis
+    redis-rest
   ```
 
 - If Redis is running on the host:

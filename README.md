@@ -279,6 +279,7 @@ docker run -d \
 ├── Dockerfile              # Dockerfile for containerization
 ├── e2e/                    # End-to-end test stack (docker compose + run.sh)
 ├── .github/workflows/      # CI: test, e2e, build & publish image
+├── LICENSE                 # MIT License
 └── .env                    # Environment variables (not committed to Git)
 ```
 

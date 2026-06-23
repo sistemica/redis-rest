@@ -1,0 +1,27 @@
+# End-to-end test stack: a Redis-compatible store + the API built from this repo.
+# Override the datastore image with REDIS_IMAGE, e.g.:
+#   REDIS_IMAGE=redis:7-alpine docker compose up
+# Default is Valkey, the BSD-licensed community fork of Redis.
+
+services:
+  redis:
+    image: ${REDIS_IMAGE:-valkey/valkey:8-alpine}
+    expose:
+      - "6379"
+
+  api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      APP_PORT: "8081"
+      API_TOKEN: ${API_TOKEN:-testtoken}
+      MAX_BODY_BYTES: ${MAX_BODY_BYTES:-65536}
+    ports:
+      - "${HOST_PORT:-8081}:8081"
+    depends_on:
+      - redis
+    # Redis may not be ready on first attempt; let Docker restart until it connects.
+    restart: on-failure

@@ -24,7 +24,10 @@ go.work.sum
 # env file
 .env
 
-  GNU nano 7.2                                                                      .dockerignore                                                                                
+# compiled binaries
+/restredis
+/redis-rest-api
+
 node_modules/
 test/
 

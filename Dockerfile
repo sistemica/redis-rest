@@ -1,35 +1,28 @@
-# Use an official Golang image to build the application
+# Build the application
 FROM golang:1.23-alpine AS builder
 
-# Set the working directory inside the container
 WORKDIR /app
 
-# Copy go.mod and go.sum files
+# Download dependencies first to leverage layer caching
 COPY go.mod go.sum ./
-
-# Download dependencies
 RUN go mod download
 
-# Copy the rest of the application code
+# Copy the source and build a static binary
 COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o redis-rest-api .
 
-# Build the Go application
-RUN go build -o redis-rest-api .
-
-# Use a minimal runtime image
+# Minimal runtime image
 FROM alpine:latest
 
-# Install necessary dependencies
-RUN apk --no-cache add ca-certificates
+RUN apk --no-cache add ca-certificates \
+    && adduser -D -u 10001 appuser
 
-# Set the working directory
-WORKDIR /root/
-
-# Copy the binary from the builder stage
+WORKDIR /app
 COPY --from=builder /app/redis-rest-api .
 
-# Expose the port the app runs on
+# Run as an unprivileged user
+USER appuser
+
 EXPOSE 8081
 
-# Command to run the executable
 CMD ["./redis-rest-api"]

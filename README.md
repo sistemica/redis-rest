@@ -11,6 +11,8 @@
   - **SET**: Store raw values with optional expiration.
   - **GET**: Retrieve stored values.
   - **DELETE**: Remove keys from the database.
+  - **Hashes**: Set/get/delete individual hash fields (`HSET`/`HGET`/`HDEL`).
+- Optional bearer-token authentication.
 - Easily configurable via environment variables.
 - Dockerized for deployment flexibility.
 - Designed to work with Redis running locally, in Docker, or on a remote host.
@@ -87,6 +89,48 @@ Key 'mykey' deleted successfully
 
 ---
 
+## **Hash Endpoints**
+
+Hash fields are addressed as `/:key/:field` (two path segments). These map to the
+Redis `HSET`, `HGET`, and `HDEL` commands.
+
+### **4. Set Hash Field**
+**URL**: `POST /:key/:field`
+
+**Description**: Set a single field of the hash stored at `key`. The body is the raw value.
+
+```bash
+curl -X POST "http://localhost:8081/user1/name" -d "Elvis"
+curl -X POST "http://localhost:8081/user1/last_name" -d "Presley"
+```
+
+### **5. Get Hash Field**
+**URL**: `GET /:key/:field`
+
+**Description**: Retrieve a single field of a hash. Returns `404` if the field (or hash) does not exist.
+
+```bash
+curl "http://localhost:8081/user1/name"
+# Elvis
+```
+
+### **6. Delete Hash Field**
+**URL**: `DELETE /:key/:field`
+
+**Description**: Remove a single field from a hash. Returns `404` if the field does not exist.
+
+```bash
+curl -X DELETE "http://localhost:8081/user1/name"
+curl "http://localhost:8081/user1/name"
+# HTTP 404 Field not found
+```
+
+> **Note:** single-segment paths (`/:key`) operate on string values; two-segment
+> paths (`/:key/:field`) operate on hash fields. Keys and fields containing `/`
+> are not supported.
+
+---
+
 ## **Environment Variables**
 
 The app uses environment variables for configuration. These variables can be set directly in the runtime environment or passed using a `.env` file.
@@ -97,6 +141,8 @@ The app uses environment variables for configuration. These variables can be set
 | `REDIS_PORT`     | The Redis server port.                     | `6379`        |
 | `REDIS_PASSWORD` | The password for the Redis server (if any). | (empty)       |
 | `APP_PORT`       | The port for the REST API server.          | `8081`        |
+| `API_TOKEN`      | Bearer token required on key endpoints. If empty, the API is **unauthenticated**. | (empty) |
+| `MAX_BODY_BYTES` | Maximum accepted request body size, in bytes. | `1048576` (1 MiB) |
 
 **Example `.env` File**:
 ```dotenv
@@ -104,7 +150,33 @@ REDIS_HOST=redis-server
 REDIS_PORT=6379
 REDIS_PASSWORD=
 APP_PORT=8081
+API_TOKEN=
+MAX_BODY_BYTES=1048576
 ```
+
+---
+
+## **Authentication**
+
+When `API_TOKEN` is set, every request to the key endpoints (`GET`/`POST`/`DELETE /:key`)
+must include a matching bearer token:
+
+```bash
+curl -H "Authorization: Bearer $API_TOKEN" "http://localhost:8081/mykey"
+```
+
+Requests without a valid token receive `401 Unauthorized`. If `API_TOKEN` is left
+empty the API accepts all requests and logs a warning at startup. The `/health`
+endpoint is always unauthenticated.
+
+---
+
+## **Health Check**
+
+**URL**: `GET /health`
+
+Returns `200 OK` when the service can reach Redis, or `503 Service Unavailable`
+otherwise. Useful for container/orchestrator liveness and readiness probes.
 
 ---
 
@@ -173,17 +245,35 @@ docker run -d \
 ## **Development**
 
 ### **Requirements**
-- Go 1.20 or later
+- Go 1.22 or later
 - Redis (local or remote)
 
 ### **Directory Structure**
 ```
 .
 ├── main.go         # Application entry point
+├── main_test.go    # Unit tests (run with `go test ./...`)
 ├── go.mod          # Go module definition
 ├── go.sum          # Dependencies checksum
 ├── Dockerfile      # Dockerfile for containerization
 └── .env            # Environment variables (not committed to Git)
+```
+
+### **Running Tests**
+The test suite uses an in-memory Redis ([miniredis](https://github.com/alicebob/miniredis)),
+so no running Redis instance is required:
+```bash
+go test ./...
+```
+
+### **End-to-End Tests**
+`e2e/run.sh` builds the API image, starts it alongside a Redis-compatible
+datastore (Valkey by default) via docker compose, runs every scenario against
+the live stack, and tears it down:
+```bash
+./e2e/run.sh                            # against Valkey (BSD-licensed Redis fork)
+REDIS_IMAGE=redis:7-alpine ./e2e/run.sh # against Redis
+HOST_PORT=18081 ./e2e/run.sh            # if 8081 is taken
 ```
 
 ### **Testing the Endpoints**
@@ -214,7 +304,6 @@ docker run -d \
 ## **Extending the App**
 
 ### **Additional Features**
-- **Authentication**: Add basic authentication or API tokens for secure access.
 - **Additional Redis Commands**:
   - Support for more commands like `EXISTS`, `INCR`, `HGET`, etc.
 - **Monitoring**:

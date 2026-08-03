@@ -221,6 +221,60 @@ func TestHealth(t *testing.T) {
 	}
 }
 
+func TestGetEnvWithLegacy(t *testing.T) {
+	t.Run("uses new key when set", func(t *testing.T) {
+		t.Setenv("REDIS_REST_API_TOKEN", "new")
+		t.Setenv("API_TOKEN", "old")
+		if got := getEnvWithLegacy("REDIS_REST_API_TOKEN", "API_TOKEN", "fallback"); got != "new" {
+			t.Fatalf("got %q, want %q", got, "new")
+		}
+	})
+
+	t.Run("falls back to legacy key", func(t *testing.T) {
+		t.Setenv("API_TOKEN", "old")
+		if got := getEnvWithLegacy("REDIS_REST_API_TOKEN", "API_TOKEN", "fallback"); got != "old" {
+			t.Fatalf("got %q, want %q", got, "old")
+		}
+	})
+
+	t.Run("uses fallback when neither set", func(t *testing.T) {
+		if got := getEnvWithLegacy("REDIS_REST_API_TOKEN", "API_TOKEN", "fallback"); got != "fallback" {
+			t.Fatalf("got %q, want %q", got, "fallback")
+		}
+	})
+}
+
+func TestGetEnvInt64WithLegacy(t *testing.T) {
+	t.Run("uses new key when set", func(t *testing.T) {
+		t.Setenv("REDIS_REST_MAX_BODY_BYTES", "2048")
+		t.Setenv("MAX_BODY_BYTES", "4096")
+		if got := getEnvInt64WithLegacy("REDIS_REST_MAX_BODY_BYTES", "MAX_BODY_BYTES", 1); got != 2048 {
+			t.Fatalf("got %d, want 2048", got)
+		}
+	})
+
+	t.Run("falls back to legacy key", func(t *testing.T) {
+		t.Setenv("MAX_BODY_BYTES", "4096")
+		if got := getEnvInt64WithLegacy("REDIS_REST_MAX_BODY_BYTES", "MAX_BODY_BYTES", 1); got != 4096 {
+			t.Fatalf("got %d, want 4096", got)
+		}
+	})
+
+	t.Run("uses fallback when neither set", func(t *testing.T) {
+		if got := getEnvInt64WithLegacy("REDIS_REST_MAX_BODY_BYTES", "MAX_BODY_BYTES", 1); got != 1 {
+			t.Fatalf("got %d, want 1", got)
+		}
+	})
+
+	t.Run("invalid new key value uses fallback, ignoring legacy", func(t *testing.T) {
+		t.Setenv("REDIS_REST_MAX_BODY_BYTES", "abc")
+		t.Setenv("MAX_BODY_BYTES", "4096")
+		if got := getEnvInt64WithLegacy("REDIS_REST_MAX_BODY_BYTES", "MAX_BODY_BYTES", 1); got != 1 {
+			t.Fatalf("got %d, want 1", got)
+		}
+	})
+}
+
 func TestBinaryRoundTrip(t *testing.T) {
 	srv, _ := newTestServer(t, "")
 	payload := string([]byte{0x00, 0x01, 0xff, 0xfe, 0x10})

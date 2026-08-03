@@ -254,14 +254,14 @@ func main() {
 
 	srv := &server{
 		rdb:          rdb,
-		maxBodyBytes: getEnvInt64("MAX_BODY_BYTES", defaultMaxBodyBytes),
-		apiToken:     os.Getenv("API_TOKEN"),
+		maxBodyBytes: getEnvInt64WithLegacy("REDIS_REST_MAX_BODY_BYTES", "MAX_BODY_BYTES", defaultMaxBodyBytes),
+		apiToken:     getEnvWithLegacy("REDIS_REST_API_TOKEN", "API_TOKEN", ""),
 	}
 	if srv.apiToken == "" {
-		log.Println("WARNING: API_TOKEN is not set — the API is unauthenticated")
+		log.Println("WARNING: REDIS_REST_API_TOKEN is not set — the API is unauthenticated")
 	}
 
-	port := getEnv("APP_PORT", "8081")
+	port := getEnvWithLegacy("REDIS_REST_APP_PORT", "APP_PORT", "8081")
 	httpServer := &http.Server{
 		Addr:              ":" + port,
 		Handler:           srv.handler(),
@@ -308,6 +308,39 @@ func getEnvInt64(key string, fallback int64) int64 {
 			return n
 		}
 		log.Printf("Invalid %s value %q, using default %d", key, v, fallback)
+	}
+	return fallback
+}
+
+// getEnvWithLegacy reads key, falling back to legacyKey (with a deprecation
+// warning) for app-specific variables that were previously unprefixed and
+// could collide with other services' variables in a shared .env file.
+func getEnvWithLegacy(key, legacyKey, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	if v := os.Getenv(legacyKey); v != "" {
+		log.Printf("WARNING: %s is deprecated, use %s instead", legacyKey, key)
+		return v
+	}
+	return fallback
+}
+
+// getEnvInt64WithLegacy is the int64 counterpart of getEnvWithLegacy.
+func getEnvInt64WithLegacy(key, legacyKey string, fallback int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
+		log.Printf("Invalid %s value %q, using default %d", key, v, fallback)
+		return fallback
+	}
+	if v := os.Getenv(legacyKey); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			log.Printf("WARNING: %s is deprecated, use %s instead", legacyKey, key)
+			return n
+		}
+		log.Printf("Invalid %s value %q, using default %d", legacyKey, v, fallback)
 	}
 	return fallback
 }

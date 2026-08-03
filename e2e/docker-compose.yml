@@ -16,9 +16,9 @@ services:
     environment:
       REDIS_HOST: redis
       REDIS_PORT: "6379"
-      APP_PORT: "8081"
-      API_TOKEN: ${API_TOKEN:-testtoken}
-      MAX_BODY_BYTES: ${MAX_BODY_BYTES:-65536}
+      REDIS_REST_APP_PORT: "8081"
+      REDIS_REST_API_TOKEN: ${API_TOKEN:-testtoken}
+      REDIS_REST_MAX_BODY_BYTES: ${MAX_BODY_BYTES:-65536}
     ports:
       - "${HOST_PORT:-8081}:8081"
     depends_on:

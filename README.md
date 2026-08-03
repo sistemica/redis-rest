@@ -46,7 +46,7 @@ Key 'mykey' set successfully
 ```
 
 **Errors**: `400 Bad Request` if `expiration` is not a non-negative integer;
-`413 Request Entity Too Large` if the body exceeds `MAX_BODY_BYTES`.
+`413 Request Entity Too Large` if the body exceeds `REDIS_REST_MAX_BODY_BYTES`.
 
 ---
 
@@ -142,40 +142,47 @@ curl "http://localhost:8081/user1/name"
 
 The app uses environment variables for configuration. These variables can be set directly in the runtime environment or passed using a `.env` file.
 
-| Variable        | Description                                | Default Value |
-|------------------|--------------------------------------------|---------------|
-| `REDIS_HOST`     | The hostname or IP address of the Redis server. | `localhost`   |
-| `REDIS_PORT`     | The Redis server port.                     | `6379`        |
-| `REDIS_PASSWORD` | The password for the Redis server (if any). | (empty)       |
-| `APP_PORT`       | The port for the REST API server.          | `8081`        |
-| `API_TOKEN`      | Bearer token required on key endpoints. If empty, the API is **unauthenticated**. | (empty) |
-| `MAX_BODY_BYTES` | Maximum accepted request body size, in bytes. | `1048576` (1 MiB) |
+| Variable                    | Description                                | Default Value |
+|------------------------------|--------------------------------------------|---------------|
+| `REDIS_HOST`                 | The hostname or IP address of the Redis server. | `localhost`   |
+| `REDIS_PORT`                 | The Redis server port.                     | `6379`        |
+| `REDIS_PASSWORD`             | The password for the Redis server (if any). | (empty)       |
+| `REDIS_REST_APP_PORT`        | The port for the REST API server.          | `8081`        |
+| `REDIS_REST_API_TOKEN`       | Bearer token required on key endpoints. If empty, the API is **unauthenticated**. | (empty) |
+| `REDIS_REST_MAX_BODY_BYTES`  | Maximum accepted request body size, in bytes. | `1048576` (1 MiB) |
+
+> **Deprecated:** the unprefixed `APP_PORT`, `API_TOKEN`, and `MAX_BODY_BYTES`
+> names are still read as a fallback (with a startup warning) so existing
+> deployments keep working, but the `REDIS_REST_`-prefixed names above avoid
+> collisions when this `.env` is merged into a larger file alongside other
+> services (e.g. in `docker compose`). `REDIS_HOST`/`REDIS_PORT`/`REDIS_PASSWORD`
+> are left unprefixed since they follow standard Redis client conventions.
 
 **Example `.env` File**:
 ```dotenv
 REDIS_HOST=redis-server
 REDIS_PORT=6379
 REDIS_PASSWORD=
-APP_PORT=8081
-API_TOKEN=
-MAX_BODY_BYTES=1048576
+REDIS_REST_APP_PORT=8081
+REDIS_REST_API_TOKEN=
+REDIS_REST_MAX_BODY_BYTES=1048576
 ```
 
 ---
 
 ## **Authentication**
 
-When `API_TOKEN` is set, every request to the string and hash endpoints
-(`GET`/`POST`/`DELETE` on `/:key` and `/:key/:field`) must include a matching
-bearer token:
+When `REDIS_REST_API_TOKEN` is set, every request to the string and hash
+endpoints (`GET`/`POST`/`DELETE` on `/:key` and `/:key/:field`) must include a
+matching bearer token:
 
 ```bash
-curl -H "Authorization: Bearer $API_TOKEN" "http://localhost:8081/mykey"
+curl -H "Authorization: Bearer $REDIS_REST_API_TOKEN" "http://localhost:8081/mykey"
 ```
 
-Requests without a valid token receive `401 Unauthorized`. If `API_TOKEN` is left
-empty the API accepts all requests and logs a warning at startup. The `/health`
-endpoint is always unauthenticated.
+Requests without a valid token receive `401 Unauthorized`. If
+`REDIS_REST_API_TOKEN` is left empty the API accepts all requests and logs a
+warning at startup. The `/health` endpoint is always unauthenticated.
 
 ---
 

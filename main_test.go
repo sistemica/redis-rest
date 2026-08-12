@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -23,9 +25,16 @@ func newTestServer(t *testing.T, apiToken string) (*server, *miniredis.Miniredis
 	t.Cleanup(mr.Close)
 
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	t.Cleanup(func() { _ = rdb.Close() })
 
-	return &server{rdb: rdb, maxBodyBytes: defaultMaxBodyBytes, apiToken: apiToken}, mr
+	srv := &server{
+		rdb:          rdb,
+		redisAddr:    mr.Addr(),
+		dbClients:    make(map[int]*redis.Client),
+		maxBodyBytes: defaultMaxBodyBytes,
+		apiToken:     apiToken,
+	}
+	t.Cleanup(srv.Close)
+	return srv, mr
 }
 
 // do builds a request, runs it through the server handler, and returns the
@@ -43,6 +52,17 @@ func do(t *testing.T, srv *server, method, target, body string, headers map[stri
 	rec := httptest.NewRecorder()
 	srv.handler().ServeHTTP(rec, req)
 	return rec
+}
+
+// decodeJSON unmarshals a response recorder's body, failing the test on
+// invalid JSON.
+func decodeJSON[T any](t *testing.T, rec *httptest.ResponseRecorder) T {
+	t.Helper()
+	var v T
+	if err := json.Unmarshal(rec.Body.Bytes(), &v); err != nil {
+		t.Fatalf("invalid JSON response %q: %v", rec.Body.String(), err)
+	}
+	return v
 }
 
 func TestSetAndGet(t *testing.T) {
@@ -285,5 +305,402 @@ func TestBinaryRoundTrip(t *testing.T) {
 	rec := do(t, srv, http.MethodGet, "/bin", "", nil)
 	if rec.Body.String() != payload {
 		t.Fatalf("binary round-trip mismatch")
+	}
+}
+
+// --- /v1 routes ---
+
+func TestV1SetAndGetJSON(t *testing.T) {
+	srv, mr := newTestServer(t, "")
+
+	rec := do(t, srv, http.MethodPost, "/v1/string/mykey", "hello world", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("set: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	status := decodeJSON[statusResponse](t, rec)
+	if status.Status != "ok" {
+		t.Fatalf("status = %q, want %q", status.Status, "ok")
+	}
+	if got, _ := mr.Get("mykey"); got != "hello world" {
+		t.Fatalf("stored value = %q, want %q", got, "hello world")
+	}
+
+	rec = do(t, srv, http.MethodGet, "/v1/string/mykey", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get: got %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("content-type = %q, want application/json", ct)
+	}
+	val := decodeJSON[valueResponse](t, rec)
+	if val.Value != "hello world" || val.Encoding != "" {
+		t.Fatalf("got value=%q encoding=%q, want value=%q encoding=\"\"", val.Value, val.Encoding, "hello world")
+	}
+}
+
+func TestV1GetMissingKey(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	rec := do(t, srv, http.MethodGet, "/v1/string/nope", "", nil)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("got %d, want 404", rec.Code)
+	}
+	errResp := decodeJSON[errorResponse](t, rec)
+	if errResp.Error != "Key not found" {
+		t.Fatalf("error = %q, want %q", errResp.Error, "Key not found")
+	}
+}
+
+func TestV1SetWithExpiration(t *testing.T) {
+	srv, mr := newTestServer(t, "")
+
+	rec := do(t, srv, http.MethodPost, "/v1/string/temp?expiration=60", "value", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200", rec.Code)
+	}
+	if ttl := mr.TTL("temp"); ttl != 60*time.Second {
+		t.Fatalf("ttl = %v, want 60s", ttl)
+	}
+}
+
+func TestV1SetInvalidExpiration(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	for _, exp := range []string{"abc", "-5"} {
+		rec := do(t, srv, http.MethodPost, "/v1/string/k?expiration="+exp, "v", nil)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expiration=%q: got %d, want 400", exp, rec.Code)
+		}
+		errResp := decodeJSON[errorResponse](t, rec)
+		if errResp.Error == "" {
+			t.Fatalf("expiration=%q: expected non-empty error message", exp)
+		}
+	}
+}
+
+func TestV1SetBodyTooLarge(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	srv.maxBodyBytes = 8
+	rec := do(t, srv, http.MethodPost, "/v1/string/big", strings.Repeat("x", 100), nil)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("got %d, want 413", rec.Code)
+	}
+}
+
+func TestV1Delete(t *testing.T) {
+	srv, mr := newTestServer(t, "")
+	_ = mr.Set("gone", "v")
+
+	rec := do(t, srv, http.MethodDelete, "/v1/string/gone", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete: got %d, want 200", rec.Code)
+	}
+	status := decodeJSON[statusResponse](t, rec)
+	if status.Status != "ok" {
+		t.Fatalf("status = %q, want %q", status.Status, "ok")
+	}
+	if mr.Exists("gone") {
+		t.Fatal("key still present after delete")
+	}
+}
+
+func TestV1DeleteMissingKey(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	rec := do(t, srv, http.MethodDelete, "/v1/string/absent", "", nil)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("got %d, want 404", rec.Code)
+	}
+}
+
+func TestV1Auth(t *testing.T) {
+	srv, _ := newTestServer(t, "s3cret")
+
+	if rec := do(t, srv, http.MethodGet, "/v1/string/k", "", nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("missing token: got %d, want 401", rec.Code)
+	}
+	if rec := do(t, srv, http.MethodGet, "/v1/string/k", "", map[string]string{"Authorization": "Bearer wrong"}); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong token: got %d, want 401", rec.Code)
+	}
+	if rec := do(t, srv, http.MethodGet, "/v1/string/k", "", map[string]string{"Authorization": "Bearer s3cret"}); rec.Code != http.StatusNotFound {
+		t.Fatalf("valid token: got %d, want 404", rec.Code)
+	}
+}
+
+func TestV1HashSetGetDelete(t *testing.T) {
+	srv, mr := newTestServer(t, "")
+
+	if rec := do(t, srv, http.MethodPost, "/v1/hash/user1/name", "Elvis", nil); rec.Code != http.StatusOK {
+		t.Fatalf("hset name: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if rec := do(t, srv, http.MethodPost, "/v1/hash/user1/last_name", "Presley", nil); rec.Code != http.StatusOK {
+		t.Fatalf("hset last_name: got %d", rec.Code)
+	}
+	if got := mr.HGet("user1", "name"); got != "Elvis" {
+		t.Fatalf("stored field = %q, want %q", got, "Elvis")
+	}
+
+	rec := do(t, srv, http.MethodGet, "/v1/hash/user1/name", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("hget name: got %d", rec.Code)
+	}
+	val := decodeJSON[valueResponse](t, rec)
+	if val.Value != "Elvis" {
+		t.Fatalf("hget name = %q, want %q", val.Value, "Elvis")
+	}
+
+	if rec := do(t, srv, http.MethodDelete, "/v1/hash/user1/name", "", nil); rec.Code != http.StatusOK {
+		t.Fatalf("hdel name: got %d", rec.Code)
+	}
+	if rec := do(t, srv, http.MethodGet, "/v1/hash/user1/name", "", nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("hget after del: got %d, want 404", rec.Code)
+	}
+}
+
+func TestV1HashGetMissingField(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	rec := do(t, srv, http.MethodGet, "/v1/hash/nohash/nofield", "", nil)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("got %d, want 404", rec.Code)
+	}
+	errResp := decodeJSON[errorResponse](t, rec)
+	if errResp.Error != "Field not found" {
+		t.Fatalf("error = %q, want %q", errResp.Error, "Field not found")
+	}
+}
+
+func TestV1HashDeleteMissingField(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	rec := do(t, srv, http.MethodDelete, "/v1/hash/nohash/nofield", "", nil)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("got %d, want 404", rec.Code)
+	}
+}
+
+func TestV1BinaryValueBase64Encoded(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	payload := string([]byte{0x00, 0x01, 0xff, 0xfe, 0x10})
+
+	if rec := do(t, srv, http.MethodPost, "/v1/string/bin", payload, nil); rec.Code != http.StatusOK {
+		t.Fatalf("set: got %d", rec.Code)
+	}
+
+	rec := do(t, srv, http.MethodGet, "/v1/string/bin", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get: got %d", rec.Code)
+	}
+	val := decodeJSON[valueResponse](t, rec)
+	if val.Encoding != "base64" {
+		t.Fatalf("encoding = %q, want %q", val.Encoding, "base64")
+	}
+	decoded, err := base64.StdEncoding.DecodeString(val.Value)
+	if err != nil {
+		t.Fatalf("invalid base64 value: %v", err)
+	}
+	if string(decoded) != payload {
+		t.Fatalf("decoded value = %q, want %q", decoded, payload)
+	}
+}
+
+func TestV1RawAcceptOctetStream(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	payload := string([]byte{0x00, 0x01, 0xff, 0xfe, 0x10})
+
+	if rec := do(t, srv, http.MethodPost, "/v1/string/bin", payload, nil); rec.Code != http.StatusOK {
+		t.Fatalf("set: got %d", rec.Code)
+	}
+
+	rec := do(t, srv, http.MethodGet, "/v1/string/bin", "", map[string]string{"Accept": "application/octet-stream"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get: got %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/octet-stream" {
+		t.Fatalf("content-type = %q, want application/octet-stream", ct)
+	}
+	if rec.Body.String() != payload {
+		t.Fatalf("raw round-trip mismatch: got %q, want %q", rec.Body.String(), payload)
+	}
+}
+
+func TestV1RawAcceptOctetStreamPlainText(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+
+	if rec := do(t, srv, http.MethodPost, "/v1/string/txt", "hello", nil); rec.Code != http.StatusOK {
+		t.Fatalf("set: got %d", rec.Code)
+	}
+	rec := do(t, srv, http.MethodGet, "/v1/string/txt", "", map[string]string{"Accept": "application/octet-stream"})
+	if rec.Code != http.StatusOK || rec.Body.String() != "hello" {
+		t.Fatalf("got %d %q, want 200 %q", rec.Code, rec.Body.String(), "hello")
+	}
+}
+
+func TestV1DBSelectionIsolatesKeys(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+
+	if rec := do(t, srv, http.MethodPost, "/v1/string/k", "db1-value", map[string]string{"X-Redis-DB": "1"}); rec.Code != http.StatusOK {
+		t.Fatalf("set on db1: got %d", rec.Code)
+	}
+
+	// Not visible on the default DB (0).
+	if rec := do(t, srv, http.MethodGet, "/v1/string/k", "", nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("get on db0: got %d, want 404", rec.Code)
+	}
+
+	// Visible on DB 1.
+	rec := do(t, srv, http.MethodGet, "/v1/string/k", "", map[string]string{"X-Redis-DB": "1"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get on db1: got %d", rec.Code)
+	}
+	val := decodeJSON[valueResponse](t, rec)
+	if val.Value != "db1-value" {
+		t.Fatalf("value = %q, want %q", val.Value, "db1-value")
+	}
+
+	// The lazily created DB-1 client is tracked for cleanup.
+	if len(srv.dbClients) != 1 {
+		t.Fatalf("dbClients = %d, want 1", len(srv.dbClients))
+	}
+}
+
+func TestV1InvalidDBHeader(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	rec := do(t, srv, http.MethodGet, "/v1/string/k", "", map[string]string{"X-Redis-DB": "abc"})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("got %d, want 400", rec.Code)
+	}
+	errResp := decodeJSON[errorResponse](t, rec)
+	if errResp.Error == "" {
+		t.Fatalf("expected non-empty error message")
+	}
+}
+
+func TestV1NotImplementedNamespaces(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	for _, path := range []string{"/v1/list/mykey", "/v1/keys/mykey"} {
+		rec := do(t, srv, http.MethodGet, path, "", nil)
+		if rec.Code != http.StatusNotImplemented {
+			t.Fatalf("%s: got %d, want 501", path, rec.Code)
+		}
+		errResp := decodeJSON[errorResponse](t, rec)
+		if errResp.Error == "" {
+			t.Fatalf("%s: expected non-empty error message", path)
+		}
+	}
+}
+
+func TestLegacyRoutesStillWorkAlongsideV1(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+
+	// A legacy write followed by a v1 read of the same key (both DB 0).
+	if rec := do(t, srv, http.MethodPost, "/legacykey", "legacy value", nil); rec.Code != http.StatusOK {
+		t.Fatalf("legacy set: got %d", rec.Code)
+	}
+	rec := do(t, srv, http.MethodGet, "/v1/string/legacykey", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("v1 get: got %d", rec.Code)
+	}
+	val := decodeJSON[valueResponse](t, rec)
+	if val.Value != "legacy value" {
+		t.Fatalf("value = %q, want %q", val.Value, "legacy value")
+	}
+}
+
+// --- /v1 edge cases ---
+
+func TestV1EmptyValueRoundTrip(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+
+	if rec := do(t, srv, http.MethodPost, "/v1/string/empty", "", nil); rec.Code != http.StatusOK {
+		t.Fatalf("set: got %d", rec.Code)
+	}
+	rec := do(t, srv, http.MethodGet, "/v1/string/empty", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get: got %d", rec.Code)
+	}
+	val := decodeJSON[valueResponse](t, rec)
+	if val.Value != "" || val.Encoding != "" {
+		t.Fatalf("got value=%q encoding=%q, want empty string with no encoding", val.Value, val.Encoding)
+	}
+}
+
+func TestV1MultibyteUTF8Value(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	payload := "héllo wörld 🚀 日本語"
+
+	if rec := do(t, srv, http.MethodPost, "/v1/string/utf8", payload, nil); rec.Code != http.StatusOK {
+		t.Fatalf("set: got %d", rec.Code)
+	}
+	rec := do(t, srv, http.MethodGet, "/v1/string/utf8", "", nil)
+	val := decodeJSON[valueResponse](t, rec)
+	if val.Encoding != "" {
+		t.Fatalf("encoding = %q, want no encoding for valid UTF-8", val.Encoding)
+	}
+	if val.Value != payload {
+		t.Fatalf("value = %q, want %q", val.Value, payload)
+	}
+}
+
+func TestV1KeyWithSpecialCharacters(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+
+	// URL-encoded space and slash-adjacent characters in the key segment.
+	rec := do(t, srv, http.MethodPost, "/v1/string/my%20key%3A1", "v", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("set: got %d", rec.Code)
+	}
+	rec = do(t, srv, http.MethodGet, "/v1/string/my%20key%3A1", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get: got %d", rec.Code)
+	}
+	val := decodeJSON[valueResponse](t, rec)
+	if val.Value != "v" {
+		t.Fatalf("value = %q, want %q", val.Value, "v")
+	}
+}
+
+func TestV1SetZeroExpirationMeansNoExpiry(t *testing.T) {
+	srv, mr := newTestServer(t, "")
+
+	if rec := do(t, srv, http.MethodPost, "/v1/string/k?expiration=0", "v", nil); rec.Code != http.StatusOK {
+		t.Fatalf("set: got %d", rec.Code)
+	}
+	if ttl := mr.TTL("k"); ttl != 0 {
+		t.Fatalf("ttl = %v, want no expiry (0)", ttl)
+	}
+}
+
+func TestV1DBHeaderZeroIsExplicitDefault(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+
+	if rec := do(t, srv, http.MethodPost, "/v1/string/k", "v", map[string]string{"X-Redis-DB": "0"}); rec.Code != http.StatusOK {
+		t.Fatalf("set: got %d", rec.Code)
+	}
+	// Explicit db=0 must use the shared default client, not a cached extra one.
+	if len(srv.dbClients) != 0 {
+		t.Fatalf("dbClients = %d, want 0 (db=0 should reuse srv.rdb)", len(srv.dbClients))
+	}
+	rec := do(t, srv, http.MethodGet, "/v1/string/k", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get: got %d", rec.Code)
+	}
+}
+
+func TestV1NegativeDBHeaderRejected(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	rec := do(t, srv, http.MethodGet, "/v1/string/k", "", map[string]string{"X-Redis-DB": "-1"})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("got %d, want 400", rec.Code)
+	}
+}
+
+func TestV1HashAuth(t *testing.T) {
+	srv, _ := newTestServer(t, "s3cret")
+	if rec := do(t, srv, http.MethodPost, "/v1/hash/h/f", "v", nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("hset without token: got %d, want 401", rec.Code)
+	}
+}
+
+func TestV1NotImplementedRequiresAuth(t *testing.T) {
+	srv, _ := newTestServer(t, "s3cret")
+	rec := do(t, srv, http.MethodGet, "/v1/list/mykey", "", nil)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("got %d, want 401", rec.Code)
 	}
 }

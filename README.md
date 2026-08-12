@@ -20,7 +20,83 @@
 
 ---
 
-## **Endpoints**
+## **`/v1` API**
+
+The `/v1` namespace is the current, stable API: explicit type prefixes instead
+of segment-count routing, structured JSON responses, and per-request database
+selection. New integrations should use this instead of the deprecated flat
+routes below.
+
+### **Content negotiation**
+
+Read endpoints (`GET`) return a JSON envelope by default:
+```json
+{"value": "hello world"}
+```
+If the stored bytes are not valid UTF-8, `value` is base64-encoded and an
+`encoding` field is added:
+```json
+{"value": "AAH//hA=", "encoding": "base64"}
+```
+Send `Accept: application/octet-stream` to get the raw bytes back instead
+(`Content-Type: application/octet-stream`), exactly as the deprecated flat
+routes always have.
+
+Write endpoints (`POST`/`DELETE`) return `{"status": "ok"}` on success. All
+errors — auth, validation, missing keys — return `{"error": "..."}` with the
+appropriate status code, regardless of the `Accept` header.
+
+### **Database selection**
+
+By default all `/v1` requests use logical database `0`. Send an
+`X-Redis-DB: N` header to target another database:
+```bash
+curl -H "X-Redis-DB: 2" "http://localhost:8081/v1/string/mykey"
+```
+
+### **String endpoints**
+
+| Method | Path | Redis command |
+|--------|------|----------------|
+| `POST` | `/v1/string/:key` (`?expiration=<seconds>` optional) | `SET` |
+| `GET` | `/v1/string/:key` | `GET` |
+| `DELETE` | `/v1/string/:key` | `DEL` |
+
+```bash
+curl -X POST "http://localhost:8081/v1/string/mykey?expiration=60" -d "This is my raw value"
+curl "http://localhost:8081/v1/string/mykey"
+# {"value":"This is my raw value"}
+curl -X DELETE "http://localhost:8081/v1/string/mykey"
+# {"status":"ok"}
+```
+
+### **Hash endpoints**
+
+| Method | Path | Redis command |
+|--------|------|----------------|
+| `POST` | `/v1/hash/:key/:field` | `HSET` |
+| `GET` | `/v1/hash/:key/:field` | `HGET` |
+| `DELETE` | `/v1/hash/:key/:field` | `HDEL` |
+
+```bash
+curl -X POST "http://localhost:8081/v1/hash/user1/name" -d "Elvis"
+curl "http://localhost:8081/v1/hash/user1/name"
+# {"value":"Elvis"}
+```
+
+### **Reserved namespaces**
+
+`/v1/list/:key` and `/v1/keys/:key` are reserved for lists ([#6](../../issues/6))
+and generic key management ([#5](../../issues/5)); until those land they
+respond `501 Not Implemented`.
+
+---
+
+## **Deprecated flat routes**
+
+> **Deprecated:** these routes predate the `/v1` namespace. They still work
+> unchanged (raw bodies in, raw bodies/plain-text out, always DB 0) but new
+> integrations should use the [`/v1` API](#v1-api) above.
 
 ### **1. Set Key-Value Pair**
 **URL**: `POST /:key`
@@ -280,7 +356,8 @@ docker run -d \
 ```
 .
 ├── main.go                 # Application entry point
-├── main_test.go            # Unit tests (run with `go test ./...`)
+├── main_test.go            # Unit/integration tests (run with `go test ./...`)
+├── main_concurrency_test.go # Concurrency tests and throughput benchmarks
 ├── go.mod                  # Go module definition
 ├── go.sum                  # Dependencies checksum
 ├── Dockerfile              # Dockerfile for containerization
@@ -292,9 +369,19 @@ docker run -d \
 
 ### **Running Tests**
 The test suite uses an in-memory Redis ([miniredis](https://github.com/alicebob/miniredis)),
-so no running Redis instance is required:
+so no running Redis instance is required. It covers both the legacy flat
+routes and the `/v1` API (unit + integration), plus concurrency and
+throughput benchmarks:
 ```bash
-go test ./...
+go test ./...              # unit + integration tests
+go test -race ./...        # same, with the data race detector
+go test -bench=. -run=^$ -benchmem ./...   # throughput benchmarks only
+```
+
+To profile a benchmark:
+```bash
+go test -bench=BenchmarkV1Get -run=^$ -cpuprofile=cpu.out -memprofile=mem.out .
+go tool pprof cpu.out
 ```
 
 ### **End-to-End Tests**

@@ -20,7 +20,123 @@
 
 ---
 
-## **Endpoints**
+## **`/v1` API**
+
+The `/v1` namespace is the current, stable API: explicit type prefixes instead
+of segment-count routing, structured JSON responses, and per-request database
+selection. New integrations should use this instead of the deprecated flat
+routes below.
+
+### **Content negotiation**
+
+Read endpoints (`GET`) return a JSON envelope by default:
+```json
+{"value": "hello world"}
+```
+If the stored bytes are not valid UTF-8, `value` is base64-encoded and an
+`encoding` field is added:
+```json
+{"value": "AAH//hA=", "encoding": "base64"}
+```
+Send `Accept: application/octet-stream` to get the raw bytes back instead
+(`Content-Type: application/octet-stream`), exactly as the deprecated flat
+routes always have.
+
+Write endpoints (`POST`/`DELETE`) return `{"status": "ok"}` on success. All
+errors — auth, validation, missing keys — return `{"error": "..."}` with the
+appropriate status code, regardless of the `Accept` header.
+
+### **Database selection**
+
+By default all `/v1` requests use logical database `0`. Send an
+`X-Redis-DB: N` header to target another database:
+```bash
+curl -H "X-Redis-DB: 2" "http://localhost:8081/v1/string/mykey"
+```
+
+### **String endpoints**
+
+| Method | Path | Redis command |
+|--------|------|----------------|
+| `POST` | `/v1/string/:key` (`?expiration=<seconds>` optional) | `SET` |
+| `GET` | `/v1/string/:key` | `GET` |
+| `DELETE` | `/v1/string/:key` | `DEL` |
+
+```bash
+curl -X POST "http://localhost:8081/v1/string/mykey?expiration=60" -d "This is my raw value"
+curl "http://localhost:8081/v1/string/mykey"
+# {"value":"This is my raw value"}
+curl -X DELETE "http://localhost:8081/v1/string/mykey"
+# {"status":"ok"}
+```
+
+### **Hash endpoints**
+
+| Method | Path | Redis command |
+|--------|------|----------------|
+| `POST` | `/v1/hash/:key/:field` | `HSET` |
+| `GET` | `/v1/hash/:key/:field` | `HGET` |
+| `DELETE` | `/v1/hash/:key/:field` | `HDEL` |
+
+```bash
+curl -X POST "http://localhost:8081/v1/hash/user1/name" -d "Elvis"
+curl "http://localhost:8081/v1/hash/user1/name"
+# {"value":"Elvis"}
+```
+
+### **List endpoints**
+
+| Method | Path | Redis command |
+|--------|------|----------------|
+| `POST` | `/v1/list/:key/left` | `LPUSH` |
+| `POST` | `/v1/list/:key/right` | `RPUSH` |
+| `DELETE` | `/v1/list/:key/left` (`?count=<n>` optional, default 1) | `LPOP` |
+| `DELETE` | `/v1/list/:key/right` (`?count=<n>` optional, default 1) | `RPOP` |
+| `GET` | `/v1/list/:key` (`?start=<n>&stop=<n>` optional, default `0`/`-1`) | `LRANGE` |
+| `GET` | `/v1/list/:key/len` | `LLEN` |
+| `GET` | `/v1/list/:key/index/:index` | `LINDEX` |
+| `DELETE` | `/v1/list/:key` | `LREM` |
+
+Push takes a JSON array of string values; pop and range return the same
+`{"value": ..., "encoding": ...}` envelope as the string/hash endpoints,
+wrapped in a `values` array. `LPOP`/`RPOP` return `404` when the list is
+empty or missing (like `GET` on a missing string key); `LRANGE`/`LLEN` return
+an empty result instead, matching Redis's own semantics for those commands.
+
+```bash
+curl -X POST "http://localhost:8081/v1/list/mylist/right" -d '{"values": ["a", "b"]}'
+curl -X POST "http://localhost:8081/v1/list/mylist/left" -d '{"values": ["z"]}'
+curl "http://localhost:8081/v1/list/mylist"
+# {"values":[{"value":"z"},{"value":"a"},{"value":"b"}]}
+curl "http://localhost:8081/v1/list/mylist/len"
+# {"length":3}
+curl "http://localhost:8081/v1/list/mylist/index/-1"
+# {"value":"b"}
+curl -X DELETE "http://localhost:8081/v1/list/mylist/left"
+# {"values":[{"value":"z"}]}
+```
+
+`LREM` takes a JSON body `{"value": "...", "count": <n>}` (`count` optional,
+defaults to `0` — remove all occurrences — following Redis `LREM` semantics
+directly: positive counts remove from the head, negative from the tail):
+
+```bash
+curl -X DELETE "http://localhost:8081/v1/list/mylist" -d '{"value": "a"}'
+# {"removed":1}
+```
+
+### **Reserved namespaces**
+
+`/v1/keys/:key` is reserved for generic key management
+([#5](../../issues/5)); until that lands it responds `501 Not Implemented`.
+
+---
+
+## **Deprecated flat routes**
+
+> **Deprecated:** these routes predate the `/v1` namespace. They still work
+> unchanged (raw bodies in, raw bodies/plain-text out, always DB 0) but new
+> integrations should use the [`/v1` API](#v1-api) above.
 
 ### **1. Set Key-Value Pair**
 **URL**: `POST /:key`
@@ -280,7 +396,8 @@ docker run -d \
 ```
 .
 ├── main.go                 # Application entry point
-├── main_test.go            # Unit tests (run with `go test ./...`)
+├── main_test.go            # Unit/integration tests (run with `go test ./...`)
+├── main_concurrency_test.go # Concurrency tests and throughput benchmarks
 ├── go.mod                  # Go module definition
 ├── go.sum                  # Dependencies checksum
 ├── Dockerfile              # Dockerfile for containerization
@@ -292,9 +409,19 @@ docker run -d \
 
 ### **Running Tests**
 The test suite uses an in-memory Redis ([miniredis](https://github.com/alicebob/miniredis)),
-so no running Redis instance is required:
+so no running Redis instance is required. It covers both the legacy flat
+routes and the `/v1` API (unit + integration), plus concurrency and
+throughput benchmarks:
 ```bash
-go test ./...
+go test ./...              # unit + integration tests
+go test -race ./...        # same, with the data race detector
+go test -bench=. -run=^$ -benchmem ./...   # throughput benchmarks only
+```
+
+To profile a benchmark:
+```bash
+go test -bench=BenchmarkV1Get -run=^$ -cpuprofile=cpu.out -memprofile=mem.out .
+go tool pprof cpu.out
 ```
 
 ### **End-to-End Tests**

@@ -28,12 +28,12 @@ key-management essentials, behind a stable, versioned API.
 The current segment-count routing will collide as more types are added. `1.0`
 introduces an explicit, versioned namespace and structured responses.
 
-- [ ] Version prefix: `/v1/...`
-- [ ] Explicit type namespaces: `/v1/string/:key`, `/v1/hash/:key`,
-      `/v1/list/:key`, `/v1/keys/:key/...`
-- [ ] Consistent JSON responses (`{"value": …}` / `{"error": …}`) with
+- [x] Version prefix: `/v1/...`
+- [x] Explicit type namespaces: `/v1/string/:key`, `/v1/hash/:key`,
+      `/v1/list/:key`, `/v1/keys/:key/...` (`/v1/keys` reserved, pending #5)
+- [x] Consistent JSON responses (`{"value": …}` / `{"error": …}`) with
       content negotiation for raw bodies
-- [ ] Database selection (`?db=N` or header) instead of hardcoded DB 0
+- [x] Database selection (`?db=N` or header) instead of hardcoded DB 0
 
 ### Complete the existing types
 
@@ -51,7 +51,7 @@ introduces an explicit, versioned namespace and structured responses.
 
 ### Lists
 
-- [ ] `LPUSH` / `RPUSH`, `LPOP` / `RPOP`, `LRANGE`, `LLEN`, `LREM`, `LINDEX`
+- [x] `LPUSH` / `RPUSH`, `LPOP` / `RPOP`, `LRANGE`, `LLEN`, `LREM`, `LINDEX`
 
 ### Cross-cutting
 

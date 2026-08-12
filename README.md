@@ -84,11 +84,51 @@ curl "http://localhost:8081/v1/hash/user1/name"
 # {"value":"Elvis"}
 ```
 
+### **List endpoints**
+
+| Method | Path | Redis command |
+|--------|------|----------------|
+| `POST` | `/v1/list/:key/left` | `LPUSH` |
+| `POST` | `/v1/list/:key/right` | `RPUSH` |
+| `DELETE` | `/v1/list/:key/left` (`?count=<n>` optional, default 1) | `LPOP` |
+| `DELETE` | `/v1/list/:key/right` (`?count=<n>` optional, default 1) | `RPOP` |
+| `GET` | `/v1/list/:key` (`?start=<n>&stop=<n>` optional, default `0`/`-1`) | `LRANGE` |
+| `GET` | `/v1/list/:key/len` | `LLEN` |
+| `GET` | `/v1/list/:key/index/:index` | `LINDEX` |
+| `DELETE` | `/v1/list/:key` | `LREM` |
+
+Push takes a JSON array of string values; pop and range return the same
+`{"value": ..., "encoding": ...}` envelope as the string/hash endpoints,
+wrapped in a `values` array. `LPOP`/`RPOP` return `404` when the list is
+empty or missing (like `GET` on a missing string key); `LRANGE`/`LLEN` return
+an empty result instead, matching Redis's own semantics for those commands.
+
+```bash
+curl -X POST "http://localhost:8081/v1/list/mylist/right" -d '{"values": ["a", "b"]}'
+curl -X POST "http://localhost:8081/v1/list/mylist/left" -d '{"values": ["z"]}'
+curl "http://localhost:8081/v1/list/mylist"
+# {"values":[{"value":"z"},{"value":"a"},{"value":"b"}]}
+curl "http://localhost:8081/v1/list/mylist/len"
+# {"length":3}
+curl "http://localhost:8081/v1/list/mylist/index/-1"
+# {"value":"b"}
+curl -X DELETE "http://localhost:8081/v1/list/mylist/left"
+# {"values":[{"value":"z"}]}
+```
+
+`LREM` takes a JSON body `{"value": "...", "count": <n>}` (`count` optional,
+defaults to `0` — remove all occurrences — following Redis `LREM` semantics
+directly: positive counts remove from the head, negative from the tail):
+
+```bash
+curl -X DELETE "http://localhost:8081/v1/list/mylist" -d '{"value": "a"}'
+# {"removed":1}
+```
+
 ### **Reserved namespaces**
 
-`/v1/list/:key` and `/v1/keys/:key` are reserved for lists ([#6](../../issues/6))
-and generic key management ([#5](../../issues/5)); until those land they
-respond `501 Not Implemented`.
+`/v1/keys/:key` is reserved for generic key management
+([#5](../../issues/5)); until that lands it responds `501 Not Implemented`.
 
 ---
 

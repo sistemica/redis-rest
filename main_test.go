@@ -573,7 +573,7 @@ func TestV1InvalidDBHeader(t *testing.T) {
 
 func TestV1NotImplementedNamespaces(t *testing.T) {
 	srv, _ := newTestServer(t, "")
-	for _, path := range []string{"/v1/list/mykey", "/v1/keys/mykey"} {
+	for _, path := range []string{"/v1/keys/mykey"} {
 		rec := do(t, srv, http.MethodGet, path, "", nil)
 		if rec.Code != http.StatusNotImplemented {
 			t.Fatalf("%s: got %d, want 501", path, rec.Code)
@@ -699,8 +699,379 @@ func TestV1HashAuth(t *testing.T) {
 
 func TestV1NotImplementedRequiresAuth(t *testing.T) {
 	srv, _ := newTestServer(t, "s3cret")
-	rec := do(t, srv, http.MethodGet, "/v1/list/mykey", "", nil)
+	rec := do(t, srv, http.MethodGet, "/v1/keys/mykey", "", nil)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("got %d, want 401", rec.Code)
+	}
+}
+
+// --- /v1/list routes (issue #6) ---
+
+func jsonBody(t *testing.T, v any) string {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("failed to marshal JSON body: %v", err)
+	}
+	return string(b)
+}
+
+func valuesOf(t *testing.T, rec *httptest.ResponseRecorder) []string {
+	t.Helper()
+	resp := decodeJSON[valuesResponse](t, rec)
+	out := make([]string, len(resp.Values))
+	for i, v := range resp.Values {
+		if v.Encoding != "" {
+			t.Fatalf("unexpected encoding %q on values[%d]", v.Encoding, i)
+		}
+		out[i] = v.Value
+	}
+	return out
+}
+
+func TestV1ListPushAndRange(t *testing.T) {
+	srv, mr := newTestServer(t, "")
+
+	rec := do(t, srv, http.MethodPost, "/v1/list/mylist/right", jsonBody(t, pushRequest{Values: []string{"a", "b"}}), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("rpush: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if got := decodeJSON[lengthResponse](t, rec); got.Length != 2 {
+		t.Fatalf("rpush length = %d, want 2", got.Length)
+	}
+
+	rec = do(t, srv, http.MethodPost, "/v1/list/mylist/left", jsonBody(t, pushRequest{Values: []string{"z"}}), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("lpush: got %d", rec.Code)
+	}
+	if got := decodeJSON[lengthResponse](t, rec); got.Length != 3 {
+		t.Fatalf("lpush length = %d, want 3", got.Length)
+	}
+
+	if got, err := mr.List("mylist"); err != nil || len(got) != 3 || got[0] != "z" {
+		t.Fatalf("miniredis list = %v, err = %v, want [z a b]", got, err)
+	}
+
+	rec = do(t, srv, http.MethodGet, "/v1/list/mylist", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("lrange: got %d", rec.Code)
+	}
+	got := valuesOf(t, rec)
+	want := []string{"z", "a", "b"}
+	if len(got) != len(want) {
+		t.Fatalf("lrange = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("lrange = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestV1ListPushEmptyValuesRejected(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	rec := do(t, srv, http.MethodPost, "/v1/list/l/left", jsonBody(t, pushRequest{Values: nil}), nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("got %d, want 400", rec.Code)
+	}
+}
+
+func TestV1ListPushInvalidJSON(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	rec := do(t, srv, http.MethodPost, "/v1/list/l/left", "not json", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("got %d, want 400", rec.Code)
+	}
+}
+
+func TestV1ListLen(t *testing.T) {
+	srv, mr := newTestServer(t, "")
+	if _, err := mr.Push("l", "a", "b", "c"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	rec := do(t, srv, http.MethodGet, "/v1/list/l/len", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d", rec.Code)
+	}
+	if got := decodeJSON[lengthResponse](t, rec); got.Length != 3 {
+		t.Fatalf("length = %d, want 3", got.Length)
+	}
+}
+
+func TestV1ListLenMissingKeyIsZero(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	rec := do(t, srv, http.MethodGet, "/v1/list/nope/len", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200", rec.Code)
+	}
+	if got := decodeJSON[lengthResponse](t, rec); got.Length != 0 {
+		t.Fatalf("length = %d, want 0", got.Length)
+	}
+}
+
+func TestV1ListIndex(t *testing.T) {
+	srv, mr := newTestServer(t, "")
+	if _, err := mr.Push("l", "a", "b", "c"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	rec := do(t, srv, http.MethodGet, "/v1/list/l/index/0", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d", rec.Code)
+	}
+	if got := decodeJSON[valueResponse](t, rec); got.Value != "a" {
+		t.Fatalf("index 0 = %q, want %q", got.Value, "a")
+	}
+
+	rec = do(t, srv, http.MethodGet, "/v1/list/l/index/-1", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d", rec.Code)
+	}
+	if got := decodeJSON[valueResponse](t, rec); got.Value != "c" {
+		t.Fatalf("index -1 = %q, want %q", got.Value, "c")
+	}
+}
+
+func TestV1ListIndexOutOfRange(t *testing.T) {
+	srv, mr := newTestServer(t, "")
+	if _, err := mr.Push("l", "a"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	rec := do(t, srv, http.MethodGet, "/v1/list/l/index/5", "", nil)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("got %d, want 404", rec.Code)
+	}
+}
+
+func TestV1ListIndexInvalid(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	rec := do(t, srv, http.MethodGet, "/v1/list/l/index/notanumber", "", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("got %d, want 400", rec.Code)
+	}
+}
+
+func TestV1ListPopLeftAndRight(t *testing.T) {
+	srv, mr := newTestServer(t, "")
+	if _, err := mr.Push("l", "a", "b", "c"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	rec := do(t, srv, http.MethodDelete, "/v1/list/l/left", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("lpop: got %d", rec.Code)
+	}
+	if got := valuesOf(t, rec); len(got) != 1 || got[0] != "a" {
+		t.Fatalf("lpop = %v, want [a]", got)
+	}
+
+	rec = do(t, srv, http.MethodDelete, "/v1/list/l/right", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("rpop: got %d", rec.Code)
+	}
+	if got := valuesOf(t, rec); len(got) != 1 || got[0] != "c" {
+		t.Fatalf("rpop = %v, want [c]", got)
+	}
+
+	remaining, _ := mr.List("l")
+	if len(remaining) != 1 || remaining[0] != "b" {
+		t.Fatalf("remaining = %v, want [b]", remaining)
+	}
+}
+
+func TestV1ListPopWithCount(t *testing.T) {
+	srv, mr := newTestServer(t, "")
+	if _, err := mr.Push("l", "a", "b", "c", "d", "e"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	rec := do(t, srv, http.MethodDelete, "/v1/list/l/left?count=2", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d", rec.Code)
+	}
+	got := valuesOf(t, rec)
+	if len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Fatalf("lpop count=2 = %v, want [a b]", got)
+	}
+}
+
+func TestV1ListPopEmptyIs404(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	rec := do(t, srv, http.MethodDelete, "/v1/list/nope/left", "", nil)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("got %d, want 404", rec.Code)
+	}
+	errResp := decodeJSON[errorResponse](t, rec)
+	if errResp.Error != "Key not found" {
+		t.Fatalf("error = %q, want %q", errResp.Error, "Key not found")
+	}
+}
+
+func TestV1ListPopInvalidCount(t *testing.T) {
+	srv, mr := newTestServer(t, "")
+	if _, err := mr.Push("l", "a"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	for _, count := range []string{"0", "-1", "abc"} {
+		rec := do(t, srv, http.MethodDelete, "/v1/list/l/left?count="+count, "", nil)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("count=%q: got %d, want 400", count, rec.Code)
+		}
+	}
+}
+
+func TestV1ListRangeMissingKeyReturnsEmptyArray(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	rec := do(t, srv, http.MethodGet, "/v1/list/nope", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200", rec.Code)
+	}
+	resp := decodeJSON[valuesResponse](t, rec)
+	if len(resp.Values) != 0 {
+		t.Fatalf("values = %v, want empty", resp.Values)
+	}
+}
+
+func TestV1ListRangeCustomBounds(t *testing.T) {
+	srv, mr := newTestServer(t, "")
+	if _, err := mr.Push("l", "a", "b", "c", "d"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	rec := do(t, srv, http.MethodGet, "/v1/list/l?start=1&stop=2", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d", rec.Code)
+	}
+	got := valuesOf(t, rec)
+	if len(got) != 2 || got[0] != "b" || got[1] != "c" {
+		t.Fatalf("lrange 1..2 = %v, want [b c]", got)
+	}
+}
+
+func TestV1ListRangeInvalidBounds(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	for _, q := range []string{"?start=abc", "?stop=abc"} {
+		rec := do(t, srv, http.MethodGet, "/v1/list/l"+q, "", nil)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: got %d, want 400", q, rec.Code)
+		}
+	}
+}
+
+func TestV1ListRem(t *testing.T) {
+	srv, mr := newTestServer(t, "")
+	if _, err := mr.Push("l", "a", "b", "a", "c", "a"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	rec := do(t, srv, http.MethodDelete, "/v1/list/l", jsonBody(t, remRequest{Value: "a"}), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if got := decodeJSON[removedResponse](t, rec); got.Removed != 3 {
+		t.Fatalf("removed = %d, want 3", got.Removed)
+	}
+
+	remaining, _ := mr.List("l")
+	if len(remaining) != 2 {
+		t.Fatalf("remaining = %v, want 2 elements", remaining)
+	}
+}
+
+func TestV1ListRemWithCount(t *testing.T) {
+	srv, mr := newTestServer(t, "")
+	if _, err := mr.Push("l", "a", "b", "a", "c", "a"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	rec := do(t, srv, http.MethodDelete, "/v1/list/l", jsonBody(t, remRequest{Value: "a", Count: 2}), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d", rec.Code)
+	}
+	if got := decodeJSON[removedResponse](t, rec); got.Removed != 2 {
+		t.Fatalf("removed = %d, want 2", got.Removed)
+	}
+}
+
+func TestV1ListRemMissingKeyRemovesZero(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	rec := do(t, srv, http.MethodDelete, "/v1/list/nope", jsonBody(t, remRequest{Value: "a"}), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200", rec.Code)
+	}
+	if got := decodeJSON[removedResponse](t, rec); got.Removed != 0 {
+		t.Fatalf("removed = %d, want 0", got.Removed)
+	}
+}
+
+func TestV1ListRemInvalidJSON(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	rec := do(t, srv, http.MethodDelete, "/v1/list/l", "not json", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("got %d, want 400", rec.Code)
+	}
+}
+
+func TestV1ListBinaryValuesBase64EncodedOnRead(t *testing.T) {
+	srv, mr := newTestServer(t, "")
+	payload := string([]byte{0x00, 0x01, 0xff, 0xfe, 0x10})
+	if _, err := mr.Push("l", payload); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	rec := do(t, srv, http.MethodGet, "/v1/list/l/index/0", "", nil)
+	val := decodeJSON[valueResponse](t, rec)
+	if val.Encoding != "base64" {
+		t.Fatalf("encoding = %q, want base64", val.Encoding)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(val.Value)
+	if err != nil || string(decoded) != payload {
+		t.Fatalf("decoded = %q (err %v), want %q", decoded, err, payload)
+	}
+
+	rec = do(t, srv, http.MethodGet, "/v1/list/l", "", nil)
+	resp := decodeJSON[valuesResponse](t, rec)
+	if len(resp.Values) != 1 || resp.Values[0].Encoding != "base64" {
+		t.Fatalf("lrange values = %+v, want one base64-encoded element", resp.Values)
+	}
+}
+
+func TestV1ListDBSelection(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+
+	rec := do(t, srv, http.MethodPost, "/v1/list/l/left", jsonBody(t, pushRequest{Values: []string{"db1"}}), map[string]string{"X-Redis-DB": "1"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("push db1: got %d", rec.Code)
+	}
+
+	rec = do(t, srv, http.MethodGet, "/v1/list/l/len", "", nil)
+	if got := decodeJSON[lengthResponse](t, rec); got.Length != 0 {
+		t.Fatalf("db0 length = %d, want 0", got.Length)
+	}
+
+	rec = do(t, srv, http.MethodGet, "/v1/list/l/len", "", map[string]string{"X-Redis-DB": "1"})
+	if got := decodeJSON[lengthResponse](t, rec); got.Length != 1 {
+		t.Fatalf("db1 length = %d, want 1", got.Length)
+	}
+}
+
+func TestV1ListAuth(t *testing.T) {
+	srv, _ := newTestServer(t, "s3cret")
+	for _, req := range []struct {
+		method, path string
+	}{
+		{http.MethodGet, "/v1/list/l"},
+		{http.MethodDelete, "/v1/list/l"},
+		{http.MethodGet, "/v1/list/l/len"},
+		{http.MethodGet, "/v1/list/l/index/0"},
+		{http.MethodPost, "/v1/list/l/left"},
+		{http.MethodPost, "/v1/list/l/right"},
+		{http.MethodDelete, "/v1/list/l/left"},
+		{http.MethodDelete, "/v1/list/l/right"},
+	} {
+		rec := do(t, srv, req.method, req.path, "", nil)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%s %s: got %d, want 401", req.method, req.path, rec.Code)
+		}
 	}
 }

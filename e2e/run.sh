@@ -202,10 +202,43 @@ reqH GET /v1/string/dbkey "X-Redis-DB: notanumber"
 check_status "GET /v1/string/dbkey with invalid X-Redis-DB is 400" 400
 
 echo "-- v1 reserved namespaces (not yet implemented)"
-req GET /v1/list/foo
-check_status "GET /v1/list/foo is 501" 501
 req GET /v1/keys/foo
 check_status "GET /v1/keys/foo is 501" 501
+
+echo "-- v1 list commands (issue #6)"
+req POST /v1/list/mylist/right -d '{"values": ["a", "b"]}'
+check_status "RPUSH mylist [a b] is 200" 200
+check_json_field "RPUSH mylist length is 2" '.length' "2"
+req POST /v1/list/mylist/left -d '{"values": ["z"]}'
+check_status "LPUSH mylist [z] is 200" 200
+check_json_field "LPUSH mylist length is 3" '.length' "3"
+req GET /v1/list/mylist
+check_status "LRANGE mylist is 200" 200
+check_json_field "LRANGE mylist is [z,a,b]" '[.values[].value] | join(",")' "z,a,b"
+req GET /v1/list/mylist/len
+check_status "LLEN mylist is 200" 200
+check_json_field "LLEN mylist is 3" '.length' "3"
+req GET /v1/list/mylist/index/0
+check_status "LINDEX mylist 0 is 200" 200
+check_json_field "LINDEX mylist 0 is 'z'" '.value' "z"
+req GET /v1/list/mylist/index/-1
+check_status "LINDEX mylist -1 is 200" 200
+check_json_field "LINDEX mylist -1 is 'b'" '.value' "b"
+req GET /v1/list/mylist/index/99
+check_status "LINDEX mylist 99 (out of range) is 404" 404
+req DELETE /v1/list/mylist/left
+check_status "LPOP mylist is 200" 200
+check_json_field "LPOP mylist popped 'z'" '.values[0].value' "z"
+req DELETE "/v1/list/mylist/right?count=2"
+check_status "RPOP mylist count=2 is 200" 200
+check_json_field "RPOP mylist popped [b,a]" '[.values[].value] | join(",")' "b,a"
+req DELETE /v1/list/nolist/left
+check_status "LPOP on empty/missing list is 404" 404
+req POST /v1/list/remlist/right -d '{"values": ["x", "y", "x", "x"]}'
+check_status "RPUSH remlist [x y x x] is 200" 200
+req DELETE /v1/list/remlist -d '{"value": "x"}'
+check_status "LREM remlist x is 200" 200
+check_json_field "LREM remlist removed 3" '.removed' "3"
 
 echo "-- legacy routes still work alongside /v1"
 req POST /legacykey --data-binary "legacy-value"

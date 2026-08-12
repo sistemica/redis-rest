@@ -307,6 +307,15 @@ func writeJSONError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, errorResponse{Error: msg})
 }
 
+// toValueResponse encodes a stored value as a valueResponse, base64-encoding
+// it (and setting Encoding) when it is not valid UTF-8.
+func toValueResponse(value []byte) valueResponse {
+	if utf8.Valid(value) {
+		return valueResponse{Value: string(value)}
+	}
+	return valueResponse{Value: base64.StdEncoding.EncodeToString(value), Encoding: "base64"}
+}
+
 // writeValue writes a stored value as the response body, honoring content
 // negotiation: "Accept: application/octet-stream" returns the raw bytes,
 // otherwise a JSON {"value": …} envelope is used (base64-encoded, with an
@@ -318,11 +327,7 @@ func writeValue(w http.ResponseWriter, r *http.Request, value []byte) {
 		w.Write(value)
 		return
 	}
-	if utf8.Valid(value) {
-		writeJSON(w, http.StatusOK, valueResponse{Value: string(value)})
-		return
-	}
-	writeJSON(w, http.StatusOK, valueResponse{Value: base64.StdEncoding.EncodeToString(value), Encoding: "base64"})
+	writeJSON(w, http.StatusOK, toValueResponse(value))
 }
 
 // setHandlerV1 stores the raw request body under the given key (SET), on the
@@ -483,9 +488,263 @@ func (s *server) hdelHandlerV1(w http.ResponseWriter, r *http.Request, ps httpro
 	writeJSON(w, http.StatusOK, statusResponse{Status: "ok"})
 }
 
+// lengthResponse is the structured JSON body for LLEN/LPUSH/RPUSH responses.
+type lengthResponse struct {
+	Length int64 `json:"length"`
+}
+
+// valuesResponse is the structured JSON body for LRANGE/LPOP/RPOP responses.
+type valuesResponse struct {
+	Values []valueResponse `json:"values"`
+}
+
+// removedResponse is the structured JSON body for LREM responses.
+type removedResponse struct {
+	Removed int64 `json:"removed"`
+}
+
+// pushRequest is the JSON request body for LPUSH/RPUSH.
+type pushRequest struct {
+	Values []string `json:"values"`
+}
+
+// remRequest is the JSON request body for LREM. Count follows Redis LREM
+// semantics directly: >0 removes that many from the head, <0 from the tail,
+// 0 (the Go zero value, so it need not be supplied) removes all occurrences.
+type remRequest struct {
+	Value string `json:"value"`
+	Count int64  `json:"count"`
+}
+
+func toValueResponses(values []string) []valueResponse {
+	out := make([]valueResponse, len(values))
+	for i, v := range values {
+		out[i] = toValueResponse([]byte(v))
+	}
+	return out
+}
+
+// listPushHandlerV1 returns a handler that LPUSHes or RPUSHes (per side) the
+// JSON-encoded values in the request body: {"values": ["a", "b"]}.
+func (s *server) listPushHandlerV1(side string) httprouter.Handle {
+	return func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+		key := ps.ByName("key")
+
+		db, err := dbFromRequest(r)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		body, err := readBody(w, r, s.maxBodyBytes)
+		if err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				writeJSONError(w, http.StatusRequestEntityTooLarge, "Request body too large")
+				return
+			}
+			writeJSONError(w, http.StatusBadRequest, "Failed to read body")
+			return
+		}
+
+		var req pushRequest
+		if err := json.Unmarshal(body, &req); err != nil || len(req.Values) == 0 {
+			writeJSONError(w, http.StatusBadRequest, `Request body must be JSON: {"values": ["..."]}`)
+			return
+		}
+
+		args := make([]any, len(req.Values))
+		for i, v := range req.Values {
+			args[i] = v
+		}
+
+		client := s.clientForDB(db)
+		var length int64
+		if side == "left" {
+			length, err = client.LPush(r.Context(), key, args...).Result()
+		} else {
+			length, err = client.RPush(r.Context(), key, args...).Result()
+		}
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		writeJSON(w, http.StatusOK, lengthResponse{Length: length})
+	}
+}
+
+// listPopHandlerV1 returns a handler that LPOPs or RPOPs (per side) up to
+// `count` values (default 1, via the optional ?count= query parameter).
+// Reports 404 when the list is empty or missing, matching the string/hash GET
+// endpoints' "not found" behavior.
+func (s *server) listPopHandlerV1(side string) httprouter.Handle {
+	return func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+		key := ps.ByName("key")
+
+		db, err := dbFromRequest(r)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		count := 1
+		if countParam := r.URL.Query().Get("count"); countParam != "" {
+			n, err := strconv.Atoi(countParam)
+			if err != nil || n < 1 {
+				writeJSONError(w, http.StatusBadRequest, "Invalid count value")
+				return
+			}
+			count = n
+		}
+
+		client := s.clientForDB(db)
+		var values []string
+		if side == "left" {
+			values, err = client.LPopCount(r.Context(), key, count).Result()
+		} else {
+			values, err = client.RPopCount(r.Context(), key, count).Result()
+		}
+		if errors.Is(err, redis.Nil) {
+			writeJSONError(w, http.StatusNotFound, "Key not found")
+			return
+		} else if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		writeJSON(w, http.StatusOK, valuesResponse{Values: toValueResponses(values)})
+	}
+}
+
+// listRangeHandlerV1 returns the elements of a list between the optional
+// ?start= and ?stop= query parameters (default 0 and -1, i.e. the whole
+// list), matching Redis LRANGE index semantics including negative indices.
+func (s *server) listRangeHandlerV1(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	key := ps.ByName("key")
+
+	db, err := dbFromRequest(r)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	start, stop := int64(0), int64(-1)
+	if v := r.URL.Query().Get("start"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "Invalid start value")
+			return
+		}
+		start = n
+	}
+	if v := r.URL.Query().Get("stop"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "Invalid stop value")
+			return
+		}
+		stop = n
+	}
+
+	values, err := s.clientForDB(db).LRange(r.Context(), key, start, stop).Result()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, valuesResponse{Values: toValueResponses(values)})
+}
+
+// listLenHandlerV1 returns a list's length (0 for a missing key, matching
+// Redis LLEN semantics — no error).
+func (s *server) listLenHandlerV1(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	key := ps.ByName("key")
+
+	db, err := dbFromRequest(r)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	length, err := s.clientForDB(db).LLen(r.Context(), key).Result()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, lengthResponse{Length: length})
+}
+
+// listIndexHandlerV1 returns the element at the given (possibly negative)
+// index, reporting 404 when the index is out of range or the key is missing.
+func (s *server) listIndexHandlerV1(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	key := ps.ByName("key")
+
+	db, err := dbFromRequest(r)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	index, err := strconv.ParseInt(ps.ByName("index"), 10, 64)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "Invalid index value")
+		return
+	}
+
+	value, err := s.clientForDB(db).LIndex(r.Context(), key, index).Bytes()
+	if errors.Is(err, redis.Nil) {
+		writeJSONError(w, http.StatusNotFound, "Index out of range")
+		return
+	} else if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeValue(w, r, value)
+}
+
+// listRemHandlerV1 removes occurrences of a value (LREM) per the JSON request
+// body {"value": "...", "count": N}. Always succeeds, even removing zero
+// elements, matching Redis LREM semantics (no error for a missing key).
+func (s *server) listRemHandlerV1(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	key := ps.ByName("key")
+
+	db, err := dbFromRequest(r)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	body, err := readBody(w, r, s.maxBodyBytes)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeJSONError(w, http.StatusRequestEntityTooLarge, "Request body too large")
+			return
+		}
+		writeJSONError(w, http.StatusBadRequest, "Failed to read body")
+		return
+	}
+
+	var req remRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, `Request body must be JSON: {"value": "...", "count": 0}`)
+		return
+	}
+
+	removed, err := s.clientForDB(db).LRem(r.Context(), key, req.Count, req.Value).Result()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, removedResponse{Removed: removed})
+}
+
 // notImplementedHandler responds 501 for namespaces reserved by the /v1
-// routing foundation but not yet implemented (lists: #6, generic key
-// management: #5).
+// routing foundation but not yet implemented (generic key management: #5).
 func (s *server) notImplementedHandler(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	writeJSONError(w, http.StatusNotImplemented, "Not implemented yet")
 }
@@ -524,10 +783,19 @@ func (s *server) handler() http.Handler {
 	v1.GET("/v1/hash/:key/:field", s.withAuth(s.hgetHandlerV1))
 	v1.DELETE("/v1/hash/:key/:field", s.withAuth(s.hdelHandlerV1))
 
-	// Namespaces reserved for future issues (#6 lists, #5 generic key
-	// management) — respond 501 until implemented.
+	// List operations (LPUSH/RPUSH/LPOP/RPOP/LRANGE/LLEN/LREM/LINDEX).
+	v1.GET("/v1/list/:key", s.withAuth(s.listRangeHandlerV1))
+	v1.DELETE("/v1/list/:key", s.withAuth(s.listRemHandlerV1))
+	v1.GET("/v1/list/:key/len", s.withAuth(s.listLenHandlerV1))
+	v1.GET("/v1/list/:key/index/:index", s.withAuth(s.listIndexHandlerV1))
+	v1.POST("/v1/list/:key/left", s.withAuth(s.listPushHandlerV1("left")))
+	v1.POST("/v1/list/:key/right", s.withAuth(s.listPushHandlerV1("right")))
+	v1.DELETE("/v1/list/:key/left", s.withAuth(s.listPopHandlerV1("left")))
+	v1.DELETE("/v1/list/:key/right", s.withAuth(s.listPopHandlerV1("right")))
+
+	// Namespace reserved for #5 (generic key management) — respond 501 until
+	// implemented.
 	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodDelete} {
-		v1.Handle(method, "/v1/list/:key", s.withAuth(s.notImplementedHandler))
 		v1.Handle(method, "/v1/keys/:key", s.withAuth(s.notImplementedHandler))
 	}
 

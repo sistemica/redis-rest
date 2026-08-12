@@ -240,6 +240,46 @@ req DELETE /v1/list/remlist -d '{"value": "x"}'
 check_status "LREM remlist x is 200" 200
 check_json_field "LREM remlist removed 3" '.removed' "3"
 
+echo "-- v1 hash bulk & field commands (issue #4)"
+req POST /v1/hash/user2/fields -d '{"fields": {"name": "Elvis", "last_name": "Presley"}}'
+check_status "multi-HSET user2 is 200" 200
+check_json_field "multi-HSET user2 added 2" '.added' "2"
+req POST /v1/hash/user2/fields -d '{"fields": {"name": "Updated"}}'
+check_status "multi-HSET user2 (update) is 200" 200
+check_json_field "multi-HSET user2 (update) added 0" '.added' "0"
+req GET /v1/hash/user2
+check_status "HGETALL user2 is 200" 200
+check_json_field "HGETALL user2 name is Updated" '.fields.name.value' "Updated"
+check_json_field "HGETALL user2 last_name is Presley" '.fields.last_name.value' "Presley"
+req GET /v1/hash/nohash
+check_status "HGETALL missing key is 200 (empty)" 200
+check_json_field "HGETALL missing key has no fields" '.fields | length' "0"
+req GET /v1/hash/user2/keys
+check_status "HKEYS user2 is 200" 200
+check_json_field "HKEYS user2 has 2 keys" '.keys | length' "2"
+req GET /v1/hash/user2/values
+check_status "HVALS user2 is 200" 200
+check_json_field "HVALS user2 has 2 values" '.values | length' "2"
+req "GET" "/v1/hash/user2/mget?fields=name,missing,last_name"
+check_status "HMGET user2 is 200" 200
+check_json_field "HMGET user2 [0] is Updated" '.values[0].value' "Updated"
+check_json_field "HMGET user2 [1] is null (missing)" '.values[1]' "null"
+req GET /v1/hash/user2/len
+check_status "HLEN user2 is 200" 200
+check_json_field "HLEN user2 is 2" '.length' "2"
+req GET /v1/hash/user2/name/exists
+check_status "HEXISTS user2 name is 200" 200
+check_json_field "HEXISTS user2 name is true" '.exists' "true"
+req GET /v1/hash/user2/nope/exists
+check_status "HEXISTS user2 nope is 200" 200
+check_json_field "HEXISTS user2 nope is false" '.exists' "false"
+req POST /v1/hash/counters/views/incrby -d '{"increment": 5}'
+check_status "HINCRBY counters views (+5) is 200" 200
+check_json_field "HINCRBY counters views value is 5" '.value' "5"
+req POST /v1/hash/counters/views/incrby -d '{"increment": -2}'
+check_status "HINCRBY counters views (-2) is 200" 200
+check_json_field "HINCRBY counters views value is 3" '.value' "3"
+
 echo "-- legacy routes still work alongside /v1"
 req POST /legacykey --data-binary "legacy-value"
 check_status "POST /legacykey (legacy) is 200" 200

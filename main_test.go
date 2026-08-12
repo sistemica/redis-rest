@@ -1075,3 +1075,316 @@ func TestV1ListAuth(t *testing.T) {
 		}
 	}
 }
+
+// --- /v1/hash bulk & field routes (issue #4) ---
+
+func TestV1HGetAll(t *testing.T) {
+	srv, mr := newTestServer(t, "")
+	mr.HSet("user1", "name", "Elvis", "last_name", "Presley")
+
+	rec := do(t, srv, http.MethodGet, "/v1/hash/user1", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d (%s)", rec.Code, rec.Body.String())
+	}
+	got := decodeJSON[hashFieldsResponse](t, rec)
+	if len(got.Fields) != 2 || got.Fields["name"].Value != "Elvis" || got.Fields["last_name"].Value != "Presley" {
+		t.Fatalf("fields = %+v, want name=Elvis last_name=Presley", got.Fields)
+	}
+}
+
+func TestV1HGetAllMissingKeyIsEmpty(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	rec := do(t, srv, http.MethodGet, "/v1/hash/nope", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200", rec.Code)
+	}
+	got := decodeJSON[hashFieldsResponse](t, rec)
+	if len(got.Fields) != 0 {
+		t.Fatalf("fields = %+v, want empty", got.Fields)
+	}
+}
+
+func TestV1HGetAllBinaryValueBase64Encoded(t *testing.T) {
+	srv, mr := newTestServer(t, "")
+	payload := string([]byte{0x00, 0x01, 0xff, 0xfe, 0x10})
+	mr.HSet("user1", "bin", payload)
+
+	rec := do(t, srv, http.MethodGet, "/v1/hash/user1", "", nil)
+	got := decodeJSON[hashFieldsResponse](t, rec)
+	field, ok := got.Fields["bin"]
+	if !ok || field.Encoding != "base64" {
+		t.Fatalf("fields[bin] = %+v, want base64-encoded", field)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(field.Value)
+	if err != nil || string(decoded) != payload {
+		t.Fatalf("decoded = %q (err %v), want %q", decoded, err, payload)
+	}
+}
+
+func TestV1MultiFieldHSet(t *testing.T) {
+	srv, mr := newTestServer(t, "")
+
+	rec := do(t, srv, http.MethodPost, "/v1/hash/user1/fields", jsonBody(t, multiSetRequest{Fields: map[string]string{"name": "Elvis", "last_name": "Presley"}}), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if got := decodeJSON[addedResponse](t, rec); got.Added != 2 {
+		t.Fatalf("added = %d, want 2", got.Added)
+	}
+	if got := mr.HGet("user1", "name"); got != "Elvis" {
+		t.Fatalf("stored name = %q, want %q", got, "Elvis")
+	}
+
+	// Setting the same fields again adds zero new fields (values still update).
+	rec = do(t, srv, http.MethodPost, "/v1/hash/user1/fields", jsonBody(t, multiSetRequest{Fields: map[string]string{"name": "Updated"}}), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d", rec.Code)
+	}
+	if got := decodeJSON[addedResponse](t, rec); got.Added != 0 {
+		t.Fatalf("added = %d, want 0 (field already existed)", got.Added)
+	}
+	if got := mr.HGet("user1", "name"); got != "Updated" {
+		t.Fatalf("stored name = %q, want %q", got, "Updated")
+	}
+}
+
+func TestV1MultiFieldHSetEmptyRejected(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	rec := do(t, srv, http.MethodPost, "/v1/hash/user1/fields", jsonBody(t, multiSetRequest{Fields: nil}), nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("got %d, want 400", rec.Code)
+	}
+}
+
+func TestV1MultiFieldHSetInvalidJSON(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	rec := do(t, srv, http.MethodPost, "/v1/hash/user1/fields", "not json", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("got %d, want 400", rec.Code)
+	}
+}
+
+func TestV1HKeys(t *testing.T) {
+	srv, mr := newTestServer(t, "")
+	mr.HSet("user1", "name", "Elvis", "last_name", "Presley")
+
+	rec := do(t, srv, http.MethodGet, "/v1/hash/user1/keys", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d", rec.Code)
+	}
+	got := decodeJSON[keysResponse](t, rec)
+	want := map[string]bool{"name": true, "last_name": true}
+	if len(got.Keys) != 2 {
+		t.Fatalf("keys = %v, want 2 entries", got.Keys)
+	}
+	for _, k := range got.Keys {
+		if !want[k] {
+			t.Fatalf("unexpected key %q in %v", k, got.Keys)
+		}
+	}
+}
+
+func TestV1HKeysMissingKeyIsEmpty(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	rec := do(t, srv, http.MethodGet, "/v1/hash/nope/keys", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200", rec.Code)
+	}
+	if got := decodeJSON[keysResponse](t, rec); len(got.Keys) != 0 {
+		t.Fatalf("keys = %v, want empty", got.Keys)
+	}
+}
+
+func TestV1HVals(t *testing.T) {
+	srv, mr := newTestServer(t, "")
+	mr.HSet("user1", "name", "Elvis")
+
+	rec := do(t, srv, http.MethodGet, "/v1/hash/user1/values", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d", rec.Code)
+	}
+	got := decodeJSON[valuesResponse](t, rec)
+	if len(got.Values) != 1 || got.Values[0].Value != "Elvis" {
+		t.Fatalf("values = %+v, want [Elvis]", got.Values)
+	}
+}
+
+func TestV1HMGet(t *testing.T) {
+	srv, mr := newTestServer(t, "")
+	mr.HSet("user1", "name", "Elvis", "last_name", "Presley")
+
+	rec := do(t, srv, http.MethodGet, "/v1/hash/user1/mget?fields=name,missing,last_name", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d", rec.Code)
+	}
+	got := decodeJSON[nullableValuesResponse](t, rec)
+	if len(got.Values) != 3 {
+		t.Fatalf("values = %+v, want 3 entries", got.Values)
+	}
+	if got.Values[0] == nil || got.Values[0].Value != "Elvis" {
+		t.Fatalf("values[0] = %v, want Elvis", got.Values[0])
+	}
+	if got.Values[1] != nil {
+		t.Fatalf("values[1] = %v, want null (missing field)", got.Values[1])
+	}
+	if got.Values[2] == nil || got.Values[2].Value != "Presley" {
+		t.Fatalf("values[2] = %v, want Presley", got.Values[2])
+	}
+}
+
+func TestV1HMGetMissingFieldsParam(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	rec := do(t, srv, http.MethodGet, "/v1/hash/user1/mget", "", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("got %d, want 400", rec.Code)
+	}
+}
+
+func TestV1HLen(t *testing.T) {
+	srv, mr := newTestServer(t, "")
+	mr.HSet("user1", "a", "1", "b", "2", "c", "3")
+
+	rec := do(t, srv, http.MethodGet, "/v1/hash/user1/len", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d", rec.Code)
+	}
+	if got := decodeJSON[lengthResponse](t, rec); got.Length != 3 {
+		t.Fatalf("length = %d, want 3", got.Length)
+	}
+}
+
+func TestV1HLenMissingKeyIsZero(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	rec := do(t, srv, http.MethodGet, "/v1/hash/nope/len", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200", rec.Code)
+	}
+	if got := decodeJSON[lengthResponse](t, rec); got.Length != 0 {
+		t.Fatalf("length = %d, want 0", got.Length)
+	}
+}
+
+func TestV1HExists(t *testing.T) {
+	srv, mr := newTestServer(t, "")
+	mr.HSet("user1", "name", "Elvis")
+
+	rec := do(t, srv, http.MethodGet, "/v1/hash/user1/name/exists", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d", rec.Code)
+	}
+	if got := decodeJSON[existsResponse](t, rec); !got.Exists {
+		t.Fatalf("exists = %v, want true", got.Exists)
+	}
+
+	rec = do(t, srv, http.MethodGet, "/v1/hash/user1/nope/exists", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200 (HEXISTS never 404s)", rec.Code)
+	}
+	if got := decodeJSON[existsResponse](t, rec); got.Exists {
+		t.Fatalf("exists = %v, want false", got.Exists)
+	}
+}
+
+func TestV1HIncrBy(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+
+	rec := do(t, srv, http.MethodPost, "/v1/hash/counters/views/incrby", jsonBody(t, incrByRequest{Increment: 5}), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if got := decodeJSON[incrByResponse](t, rec); got.Value != 5 {
+		t.Fatalf("value = %d, want 5 (field created from 0)", got.Value)
+	}
+
+	rec = do(t, srv, http.MethodPost, "/v1/hash/counters/views/incrby", jsonBody(t, incrByRequest{Increment: -2}), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d", rec.Code)
+	}
+	if got := decodeJSON[incrByResponse](t, rec); got.Value != 3 {
+		t.Fatalf("value = %d, want 3", got.Value)
+	}
+}
+
+func TestV1HIncrByInvalidJSON(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	rec := do(t, srv, http.MethodPost, "/v1/hash/counters/views/incrby", "not json", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("got %d, want 400", rec.Code)
+	}
+}
+
+func TestV1HIncrByNonNumericFieldErrors(t *testing.T) {
+	srv, mr := newTestServer(t, "")
+	mr.HSet("user1", "name", "Elvis")
+
+	rec := do(t, srv, http.MethodPost, "/v1/hash/user1/name/incrby", jsonBody(t, incrByRequest{Increment: 1}), nil)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("got %d, want 500", rec.Code)
+	}
+}
+
+// TestV1HashFieldNamedLikeReservedSegmentIsShadowed documents a real routing
+// tradeoff of the ServeMux migration: literal segments (keys/values/len/...)
+// take precedence over the {field} wildcard at the same path position, so a
+// hash field literally named e.g. "keys" is unreachable via the single-field
+// path — HGETALL/HMGET must be used to read it instead.
+func TestV1HashFieldNamedLikeReservedSegmentIsShadowed(t *testing.T) {
+	srv, mr := newTestServer(t, "")
+	mr.HSet("user1", "keys", "this is the field VALUE, not a field name list")
+
+	rec := do(t, srv, http.MethodGet, "/v1/hash/user1/keys", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d", rec.Code)
+	}
+	// Resolves to HKEYS (the reserved route), not HGET on the "keys" field.
+	got := decodeJSON[keysResponse](t, rec)
+	if len(got.Keys) != 1 || got.Keys[0] != "keys" {
+		t.Fatalf("keys = %v, want [\"keys\"] (HKEYS won the route, not HGET)", got.Keys)
+	}
+
+	// The field is still reachable via HGETALL/HMGET.
+	rec = do(t, srv, http.MethodGet, "/v1/hash/user1/mget?fields=keys", "", nil)
+	mget := decodeJSON[nullableValuesResponse](t, rec)
+	if len(mget.Values) != 1 || mget.Values[0] == nil || mget.Values[0].Value != "this is the field VALUE, not a field name list" {
+		t.Fatalf("mget values = %+v, want the shadowed field's actual value", mget.Values)
+	}
+}
+
+func TestV1HashBulkDBSelection(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+
+	if rec := do(t, srv, http.MethodPost, "/v1/hash/user1/fields", jsonBody(t, multiSetRequest{Fields: map[string]string{"name": "db1"}}), map[string]string{"X-Redis-DB": "1"}); rec.Code != http.StatusOK {
+		t.Fatalf("set db1: got %d", rec.Code)
+	}
+
+	rec := do(t, srv, http.MethodGet, "/v1/hash/user1/len", "", nil)
+	if got := decodeJSON[lengthResponse](t, rec); got.Length != 0 {
+		t.Fatalf("db0 length = %d, want 0", got.Length)
+	}
+
+	rec = do(t, srv, http.MethodGet, "/v1/hash/user1/len", "", map[string]string{"X-Redis-DB": "1"})
+	if got := decodeJSON[lengthResponse](t, rec); got.Length != 1 {
+		t.Fatalf("db1 length = %d, want 1", got.Length)
+	}
+}
+
+func TestV1HashNewEndpointsRequireAuth(t *testing.T) {
+	srv, _ := newTestServer(t, "s3cret")
+	for _, req := range []struct {
+		method, path string
+	}{
+		{http.MethodGet, "/v1/hash/user1"},
+		{http.MethodPost, "/v1/hash/user1/fields"},
+		{http.MethodGet, "/v1/hash/user1/keys"},
+		{http.MethodGet, "/v1/hash/user1/values"},
+		{http.MethodGet, "/v1/hash/user1/mget?fields=a"},
+		{http.MethodGet, "/v1/hash/user1/len"},
+		{http.MethodGet, "/v1/hash/user1/name/exists"},
+		{http.MethodPost, "/v1/hash/user1/name/incrby"},
+	} {
+		rec := do(t, srv, req.method, req.path, "", nil)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%s %s: got %d, want 401", req.method, req.path, rec.Code)
+		}
+	}
+}

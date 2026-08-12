@@ -72,17 +72,57 @@ curl -X DELETE "http://localhost:8081/v1/string/mykey"
 
 ### **Hash endpoints**
 
+Single-field operations:
+
 | Method | Path | Redis command |
 |--------|------|----------------|
 | `POST` | `/v1/hash/:key/:field` | `HSET` |
 | `GET` | `/v1/hash/:key/:field` | `HGET` |
 | `DELETE` | `/v1/hash/:key/:field` | `HDEL` |
+| `GET` | `/v1/hash/:key/:field/exists` | `HEXISTS` |
+| `POST` | `/v1/hash/:key/:field/incrby` | `HINCRBY` |
 
 ```bash
 curl -X POST "http://localhost:8081/v1/hash/user1/name" -d "Elvis"
 curl "http://localhost:8081/v1/hash/user1/name"
 # {"value":"Elvis"}
+curl "http://localhost:8081/v1/hash/user1/name/exists"
+# {"exists":true}
+curl -X POST "http://localhost:8081/v1/hash/counters/views/incrby" -d '{"increment": 5}'
+# {"value":5}
 ```
+
+Whole-hash and multi-field operations:
+
+| Method | Path | Redis command |
+|--------|------|----------------|
+| `GET` | `/v1/hash/:key` | `HGETALL` |
+| `POST` | `/v1/hash/:key/fields` | multi-field `HSET` |
+| `GET` | `/v1/hash/:key/keys` | `HKEYS` |
+| `GET` | `/v1/hash/:key/values` | `HVALS` |
+| `GET` | `/v1/hash/:key/mget?fields=a,b,c` | `HMGET` |
+| `GET` | `/v1/hash/:key/len` | `HLEN` |
+
+`HGETALL` returns a JSON object of field → value envelope; `HMGET` returns a
+`values` array in the requested field order, with `null` entries for fields
+that don't exist. `HGETALL`/`HKEYS`/`HVALS`/`HLEN` return an empty/zero result
+for a missing key rather than an error, matching Redis's own semantics for
+those commands.
+
+```bash
+curl -X POST "http://localhost:8081/v1/hash/user1/fields" -d '{"fields": {"name": "Elvis", "last_name": "Presley"}}'
+# {"added":2}
+curl "http://localhost:8081/v1/hash/user1"
+# {"fields":{"name":{"value":"Elvis"},"last_name":{"value":"Presley"}}}
+curl "http://localhost:8081/v1/hash/user1/mget?fields=name,missing"
+# {"values":[{"value":"Elvis"},null]}
+```
+
+> **Note:** literal path segments (`keys`, `values`, `mget`, `len`, `fields`,
+> `exists`, `incrby`) take precedence over a same-position `:field` name. A
+> hash field literally named e.g. `keys` is unreachable via
+> `/v1/hash/:key/keys` (that always resolves to `HKEYS`) — read it via
+> `HGETALL` or `HMGET` instead.
 
 ### **List endpoints**
 

@@ -39,7 +39,7 @@ introduces an explicit, versioned namespace and structured responses.
 
 - [ ] **Strings:** `INCR`, `DECR`, `INCRBY`, `DECRBY`, `APPEND`, `SETNX`,
       `GETSET`, `MGET`, `MSET`, `GETEX`
-- [ ] **Hashes:** `HGETALL`, `HKEYS`, `HVALS`, `HMGET`, multi-field `HSET`,
+- [x] **Hashes:** `HGETALL`, `HKEYS`, `HVALS`, `HMGET`, multi-field `HSET`,
       `HEXISTS`, `HLEN`, `HINCRBY`
 
 ### Key / generic management (the biggest current gap)

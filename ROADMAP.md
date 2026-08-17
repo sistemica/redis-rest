@@ -55,7 +55,7 @@ introduces an explicit, versioned namespace and structured responses.
 
 ### Cross-cutting
 
-- [ ] Batch / pipeline endpoint (`/v1/pipeline`) to avoid per-command HTTP cost
+- [x] Batch / pipeline endpoint (`/v1/pipeline`) to avoid per-command HTTP cost
 - [ ] OpenAPI spec + generated docs
 - [ ] README "supported commands" matrix so coverage is never misleading
 

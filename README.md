@@ -191,6 +191,52 @@ curl -X DELETE "http://localhost:8081/v1/list/mylist" -d '{"value": "a"}'
 # {"removed":1}
 ```
 
+### **Pipeline endpoint (batch, not transactional)**
+
+`POST /v1/pipeline` runs an ordered list of `/v1` requests in a single HTTP
+call, to avoid paying a full HTTP round trip per command. Each item is any
+other `/v1` route's method + path + optional body, exactly as if you'd called
+it directly:
+
+```bash
+curl -X POST "http://localhost:8081/v1/pipeline" -d '[
+  {"method": "POST", "path": "/v1/string/a", "body": "hello"},
+  {"method": "GET", "path": "/v1/string/a"},
+  {"method": "POST", "path": "/v1/list/mylist/left", "body": {"values": ["a", "b"]}}
+]'
+# {"results":[
+#   {"status":200,"body":{"status":"ok"}},
+#   {"status":200,"body":{"value":"hello"}},
+#   {"status":200,"body":{"length":2}}
+# ]}
+```
+
+`body` is either a JSON string (used verbatim as the raw request body, for
+`SET`/`HSET`-style endpoints) or a JSON object/array (used as-is, for
+JSON-body endpoints like `LPUSH`/`LREM`/`HINCRBY`/multi-field `HSET`/`MSET`).
+
+**This is a batch, not a transaction.** Items run sequentially, in the order
+given, against the same Redis connection context — but each is an
+independent request:
+
+- No atomicity: if item 3 of 5 fails, items 1–2 already took effect and are
+  **not** rolled back.
+- No isolation: another client's commands can interleave between your items.
+- A single item's own error (missing key, bad command, invalid path) produces
+  a `4xx`/`5xx` result for that item only — the pipeline keeps going and
+  still returns `200` overall. Only a malformed *pipeline request itself*
+  (invalid JSON, an empty array, more than 100 items) fails the whole call.
+
+If you need real atomicity, Redis's own `MULTI`/`EXEC` (with optional `WATCH`
+for optimistic locking) is the right primitive — that's a separate,
+not-yet-implemented feature (see `ROADMAP.md`'s `v1.1.0` section), not
+something this endpoint provides.
+
+Every item's `Authorization` and `X-Redis-DB` headers are inherited from the
+outer pipeline request (so a single token/DB selection covers the whole
+batch); each item's result body is always the standard JSON envelope,
+regardless of the outer request's `Accept` header.
+
 ### **Reserved namespaces**
 
 `/v1/keys/:key` is reserved for generic key management

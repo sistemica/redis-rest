@@ -716,6 +716,35 @@ func jsonBody(t *testing.T, v any) string {
 	return string(b)
 }
 
+// jsonRaw encodes s as a JSON string, for use as a pipelineItem.Body value
+// destined for a raw-body endpoint (e.g. string/hash-field SET).
+func jsonRaw(t *testing.T, s string) json.RawMessage {
+	t.Helper()
+	b, err := json.Marshal(s)
+	if err != nil {
+		t.Fatalf("failed to marshal JSON string: %v", err)
+	}
+	return b
+}
+
+// jsonRawObj encodes v (typically a struct or slice) as a pipelineItem.Body
+// value destined for a JSON-body endpoint (e.g. LPUSH, multi-field HSET).
+func jsonRawObj(t *testing.T, v any) json.RawMessage {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("failed to marshal JSON body: %v", err)
+	}
+	return b
+}
+
+func mustUnmarshal(t *testing.T, raw json.RawMessage, v any) {
+	t.Helper()
+	if err := json.Unmarshal(raw, v); err != nil {
+		t.Fatalf("invalid JSON %q: %v", raw, err)
+	}
+}
+
 func valuesOf(t *testing.T, rec *httptest.ResponseRecorder) []string {
 	t.Helper()
 	resp := decodeJSON[valuesResponse](t, rec)
@@ -1073,6 +1102,231 @@ func TestV1ListAuth(t *testing.T) {
 		if rec.Code != http.StatusUnauthorized {
 			t.Fatalf("%s %s: got %d, want 401", req.method, req.path, rec.Code)
 		}
+	}
+}
+
+// --- /v1/pipeline (issue #7) ---
+
+func TestV1PipelineBasic(t *testing.T) {
+	srv, mr := newTestServer(t, "")
+
+	items := []pipelineItem{
+		{Method: "POST", Path: "/v1/string/a", Body: jsonRaw(t, "hello")},
+		{Method: "GET", Path: "/v1/string/a"},
+		{Method: "GET", Path: "/v1/string/missing"},
+	}
+	rec := do(t, srv, http.MethodPost, "/v1/pipeline", jsonBody(t, items), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	resp := decodeJSON[pipelineResponse](t, rec)
+	if len(resp.Results) != 3 {
+		t.Fatalf("results = %d, want 3", len(resp.Results))
+	}
+	if resp.Results[0].Status != http.StatusOK {
+		t.Fatalf("item0 status = %d, want 200", resp.Results[0].Status)
+	}
+	var status statusResponse
+	mustUnmarshal(t, resp.Results[0].Body, &status)
+	if status.Status != "ok" {
+		t.Fatalf("item0 body = %+v, want status=ok", status)
+	}
+
+	if resp.Results[1].Status != http.StatusOK {
+		t.Fatalf("item1 status = %d, want 200", resp.Results[1].Status)
+	}
+	var val valueResponse
+	mustUnmarshal(t, resp.Results[1].Body, &val)
+	if val.Value != "hello" {
+		t.Fatalf("item1 value = %q, want %q", val.Value, "hello")
+	}
+
+	if resp.Results[2].Status != http.StatusNotFound {
+		t.Fatalf("item2 status = %d, want 404 (no abort on a failed item)", resp.Results[2].Status)
+	}
+
+	if got, _ := mr.Get("a"); got != "hello" {
+		t.Fatalf("stored a = %q, want %q", got, "hello")
+	}
+}
+
+func TestV1PipelineMixedCommandTypes(t *testing.T) {
+	srv, mr := newTestServer(t, "")
+
+	items := []pipelineItem{
+		{Method: "POST", Path: "/v1/hash/user1/name", Body: jsonRaw(t, "Elvis")},
+		{Method: "POST", Path: "/v1/list/mylist/left", Body: jsonRawObj(t, pushRequest{Values: []string{"a", "b"}})},
+		{Method: "POST", Path: "/v1/hashes/user1", Body: jsonRawObj(t, multiSetRequest{Fields: map[string]string{"last_name": "Presley"}})},
+	}
+	rec := do(t, srv, http.MethodPost, "/v1/pipeline", jsonBody(t, items), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	resp := decodeJSON[pipelineResponse](t, rec)
+	for i, r := range resp.Results {
+		if r.Status != http.StatusOK {
+			t.Fatalf("item%d status = %d (%s), want 200", i, r.Status, r.Body)
+		}
+	}
+
+	if got := mr.HGet("user1", "name"); got != "Elvis" {
+		t.Fatalf("hash user1.name = %q, want %q", got, "Elvis")
+	}
+	if got, _ := mr.List("mylist"); len(got) != 2 || got[0] != "b" || got[1] != "a" {
+		t.Fatalf("list mylist = %v, want [b a]", got)
+	}
+	if got := mr.HGet("user1", "last_name"); got != "Presley" {
+		t.Fatalf("hash user1.last_name = %q, want %q", got, "Presley")
+	}
+}
+
+func TestV1PipelineSequentialOrdering(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+
+	items := []pipelineItem{
+		{Method: "POST", Path: "/v1/string/k", Body: jsonRaw(t, "first")},
+		{Method: "GET", Path: "/v1/string/k"},
+		{Method: "POST", Path: "/v1/string/k", Body: jsonRaw(t, "second")},
+		{Method: "GET", Path: "/v1/string/k"},
+	}
+	rec := do(t, srv, http.MethodPost, "/v1/pipeline", jsonBody(t, items), nil)
+	resp := decodeJSON[pipelineResponse](t, rec)
+
+	var v1, v2 valueResponse
+	mustUnmarshal(t, resp.Results[1].Body, &v1)
+	mustUnmarshal(t, resp.Results[3].Body, &v2)
+	if v1.Value != "first" || v2.Value != "second" {
+		t.Fatalf("got %q then %q, want \"first\" then \"second\" (in-order execution)", v1.Value, v2.Value)
+	}
+}
+
+func TestV1PipelineInvalidMethod(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	items := []pipelineItem{{Method: "PATCH", Path: "/v1/string/k"}}
+	rec := do(t, srv, http.MethodPost, "/v1/pipeline", jsonBody(t, items), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("outer got %d, want 200 (per-item error, not batch failure)", rec.Code)
+	}
+	resp := decodeJSON[pipelineResponse](t, rec)
+	if resp.Results[0].Status != http.StatusBadRequest {
+		t.Fatalf("item status = %d, want 400", resp.Results[0].Status)
+	}
+}
+
+func TestV1PipelinePathOutsideV1Rejected(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	for _, path := range []string{"/legacykey", "/health", "v1/string/k", "/v1"} {
+		items := []pipelineItem{{Method: "GET", Path: path}}
+		rec := do(t, srv, http.MethodPost, "/v1/pipeline", jsonBody(t, items), nil)
+		resp := decodeJSON[pipelineResponse](t, rec)
+		if resp.Results[0].Status != http.StatusBadRequest {
+			t.Fatalf("path %q: item status = %d, want 400", path, resp.Results[0].Status)
+		}
+	}
+}
+
+func TestV1PipelineSelfReferenceRejected(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	items := []pipelineItem{{Method: "POST", Path: "/v1/pipeline", Body: jsonRawObj(t, []pipelineItem{{Method: "GET", Path: "/v1/string/k"}})}}
+	rec := do(t, srv, http.MethodPost, "/v1/pipeline", jsonBody(t, items), nil)
+	resp := decodeJSON[pipelineResponse](t, rec)
+	if resp.Results[0].Status != http.StatusBadRequest {
+		t.Fatalf("item status = %d, want 400 (no nested pipelines)", resp.Results[0].Status)
+	}
+}
+
+func TestV1PipelineEmptyRejected(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	rec := do(t, srv, http.MethodPost, "/v1/pipeline", "[]", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("got %d, want 400", rec.Code)
+	}
+}
+
+func TestV1PipelineInvalidJSON(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	rec := do(t, srv, http.MethodPost, "/v1/pipeline", "not json", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("got %d, want 400", rec.Code)
+	}
+}
+
+func TestV1PipelineTooManyItemsRejected(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	items := make([]pipelineItem, maxPipelineItems+1)
+	for i := range items {
+		items[i] = pipelineItem{Method: "GET", Path: "/v1/string/k"}
+	}
+	rec := do(t, srv, http.MethodPost, "/v1/pipeline", jsonBody(t, items), nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("got %d, want 400", rec.Code)
+	}
+}
+
+func TestV1PipelineAuthPropagatesToItems(t *testing.T) {
+	srv, _ := newTestServer(t, "s3cret")
+
+	// The outer call itself requires the token.
+	items := []pipelineItem{{Method: "GET", Path: "/v1/string/k"}}
+	rec := do(t, srv, http.MethodPost, "/v1/pipeline", jsonBody(t, items), nil)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no token: got %d, want 401", rec.Code)
+	}
+
+	// With a valid token on the outer call, items run authenticated too
+	// (not a separate 401 per item).
+	rec = do(t, srv, http.MethodPost, "/v1/pipeline", jsonBody(t, items), map[string]string{"Authorization": "Bearer s3cret"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("with token: got %d", rec.Code)
+	}
+	resp := decodeJSON[pipelineResponse](t, rec)
+	if resp.Results[0].Status != http.StatusNotFound {
+		t.Fatalf("item status = %d, want 404 (reached the handler, not 401)", resp.Results[0].Status)
+	}
+}
+
+func TestV1PipelineDBHeaderPropagatesToItems(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+
+	items := []pipelineItem{{Method: "POST", Path: "/v1/string/k", Body: jsonRaw(t, "db1-value")}}
+	rec := do(t, srv, http.MethodPost, "/v1/pipeline", jsonBody(t, items), map[string]string{"X-Redis-DB": "1"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d", rec.Code)
+	}
+
+	// Not visible on db0.
+	if rec := do(t, srv, http.MethodGet, "/v1/string/k", "", nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("db0 get: got %d, want 404", rec.Code)
+	}
+	// Visible on db1.
+	rec = do(t, srv, http.MethodGet, "/v1/string/k", "", map[string]string{"X-Redis-DB": "1"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("db1 get: got %d", rec.Code)
+	}
+}
+
+func TestV1PipelineAcceptHeaderNotForwarded(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	payload := string([]byte{0x00, 0x01, 0xff, 0xfe, 0x10})
+
+	if rec := do(t, srv, http.MethodPost, "/v1/string/bin", payload, nil); rec.Code != http.StatusOK {
+		t.Fatalf("seed: got %d", rec.Code)
+	}
+
+	// Even if the outer request asks for octet-stream, item results stay
+	// JSON-enveloped so the overall pipeline response stays valid JSON.
+	items := []pipelineItem{{Method: "GET", Path: "/v1/string/bin"}}
+	rec := do(t, srv, http.MethodPost, "/v1/pipeline", jsonBody(t, items), map[string]string{"Accept": "application/octet-stream"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d", rec.Code)
+	}
+	resp := decodeJSON[pipelineResponse](t, rec)
+	var val valueResponse
+	mustUnmarshal(t, resp.Results[0].Body, &val)
+	if val.Encoding != "base64" {
+		t.Fatalf("encoding = %q, want base64 (still the JSON envelope, not raw bytes)", val.Encoding)
 	}
 }
 

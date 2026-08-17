@@ -90,9 +90,9 @@ func (s *server) Close() {
 	}
 }
 
-// withAuth wraps a handler so it requires a valid bearer token when an API
-// token is configured. With no token configured the API is open (a warning is
-// logged at startup).
+// withAuth wraps an httprouter.Handle (used by the deprecated flat routes) so
+// it requires a valid bearer token when an API token is configured. With no
+// token configured the API is open (a warning is logged at startup).
 func (s *server) withAuth(next httprouter.Handle) httprouter.Handle {
 	return func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 		if s.apiToken != "" && !validToken(r, s.apiToken) {
@@ -100,6 +100,18 @@ func (s *server) withAuth(next httprouter.Handle) httprouter.Handle {
 			return
 		}
 		next(w, r, ps)
+	}
+}
+
+// withAuthFunc is the http.HandlerFunc counterpart of withAuth, used by the
+// /v1 routes (served from a native ServeMux rather than httprouter).
+func (s *server) withAuthFunc(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.apiToken != "" && !validToken(r, s.apiToken) {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
 	}
 }
 
@@ -332,8 +344,8 @@ func writeValue(w http.ResponseWriter, r *http.Request, value []byte) {
 
 // setHandlerV1 stores the raw request body under the given key (SET), on the
 // database selected by the X-Redis-DB header (default 0).
-func (s *server) setHandlerV1(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	key := ps.ByName("key")
+func (s *server) setHandlerV1(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
 
 	db, err := dbFromRequest(r)
 	if err != nil {
@@ -367,8 +379,8 @@ func (s *server) setHandlerV1(w http.ResponseWriter, r *http.Request, ps httprou
 }
 
 // getHandlerV1 returns the value stored under the given key (GET).
-func (s *server) getHandlerV1(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	key := ps.ByName("key")
+func (s *server) getHandlerV1(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
 
 	db, err := dbFromRequest(r)
 	if err != nil {
@@ -389,8 +401,8 @@ func (s *server) getHandlerV1(w http.ResponseWriter, r *http.Request, ps httprou
 }
 
 // deleteHandlerV1 removes the given key (DEL), reporting 404 when absent.
-func (s *server) deleteHandlerV1(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	key := ps.ByName("key")
+func (s *server) deleteHandlerV1(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
 
 	db, err := dbFromRequest(r)
 	if err != nil {
@@ -411,10 +423,89 @@ func (s *server) deleteHandlerV1(w http.ResponseWriter, r *http.Request, ps http
 	writeJSON(w, http.StatusOK, statusResponse{Status: "ok"})
 }
 
+// msetRequest is the JSON request body for MSET.
+type msetRequest struct {
+	Values map[string]string `json:"values"`
+}
+
+// msetHandlerV1 sets several string keys atomically (MSET) per the JSON
+// request body {"values": {"key1": "value1", ...}}.
+func (s *server) msetHandlerV1(w http.ResponseWriter, r *http.Request) {
+	db, err := dbFromRequest(r)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	body, err := readBody(w, r, s.maxBodyBytes)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeJSONError(w, http.StatusRequestEntityTooLarge, "Request body too large")
+			return
+		}
+		writeJSONError(w, http.StatusBadRequest, "Failed to read body")
+		return
+	}
+
+	var req msetRequest
+	if err := json.Unmarshal(body, &req); err != nil || len(req.Values) == 0 {
+		writeJSONError(w, http.StatusBadRequest, `Request body must be JSON: {"values": {"key": "value"}}`)
+		return
+	}
+
+	args := make([]any, 0, len(req.Values)*2)
+	for key, value := range req.Values {
+		args = append(args, key, value)
+	}
+
+	if err := s.clientForDB(db).MSet(r.Context(), args...).Err(); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, statusResponse{Status: "ok"})
+}
+
+// mgetHandlerV1 returns the values of several string keys (MGET), given as a
+// comma-separated ?keys=a,b,c query parameter. The result preserves the
+// requested order, with null entries for keys that don't exist.
+func (s *server) mgetHandlerV1(w http.ResponseWriter, r *http.Request) {
+	db, err := dbFromRequest(r)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	keysParam := r.URL.Query().Get("keys")
+	if keysParam == "" {
+		writeJSONError(w, http.StatusBadRequest, "Missing required ?keys=a,b,c query parameter")
+		return
+	}
+	keys := strings.Split(keysParam, ",")
+
+	values, err := s.clientForDB(db).MGet(r.Context(), keys...).Result()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	out := make([]*valueResponse, len(values))
+	for i, v := range values {
+		str, ok := v.(string)
+		if !ok {
+			continue // nil: key doesn't exist, leave as null
+		}
+		vr := toValueResponse([]byte(str))
+		out[i] = &vr
+	}
+	writeJSON(w, http.StatusOK, nullableValuesResponse{Values: out})
+}
+
 // hsetHandlerV1 stores the raw request body as a hash field's value (HSET).
-func (s *server) hsetHandlerV1(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	key := ps.ByName("key")
-	field := ps.ByName("field")
+func (s *server) hsetHandlerV1(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+	field := r.PathValue("field")
 
 	db, err := dbFromRequest(r)
 	if err != nil {
@@ -442,9 +533,9 @@ func (s *server) hsetHandlerV1(w http.ResponseWriter, r *http.Request, ps httpro
 }
 
 // hgetHandlerV1 returns a single hash field's value (HGET).
-func (s *server) hgetHandlerV1(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	key := ps.ByName("key")
-	field := ps.ByName("field")
+func (s *server) hgetHandlerV1(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+	field := r.PathValue("field")
 
 	db, err := dbFromRequest(r)
 	if err != nil {
@@ -465,9 +556,9 @@ func (s *server) hgetHandlerV1(w http.ResponseWriter, r *http.Request, ps httpro
 }
 
 // hdelHandlerV1 removes a single hash field (HDEL), reporting 404 when absent.
-func (s *server) hdelHandlerV1(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	key := ps.ByName("key")
-	field := ps.ByName("field")
+func (s *server) hdelHandlerV1(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+	field := r.PathValue("field")
 
 	db, err := dbFromRequest(r)
 	if err != nil {
@@ -488,12 +579,275 @@ func (s *server) hdelHandlerV1(w http.ResponseWriter, r *http.Request, ps httpro
 	writeJSON(w, http.StatusOK, statusResponse{Status: "ok"})
 }
 
-// lengthResponse is the structured JSON body for LLEN/LPUSH/RPUSH responses.
+// hashFieldsResponse is the structured JSON body for HGETALL responses.
+type hashFieldsResponse struct {
+	Fields map[string]valueResponse `json:"fields"`
+}
+
+// keysResponse is the structured JSON body for HKEYS responses.
+type keysResponse struct {
+	Keys []string `json:"keys"`
+}
+
+// nullableValuesResponse is the structured JSON body for HMGET responses;
+// entries are null for fields that don't exist, matching Redis HMGET.
+type nullableValuesResponse struct {
+	Values []*valueResponse `json:"values"`
+}
+
+// addedResponse is the structured JSON body for multi-field HSET responses.
+type addedResponse struct {
+	Added int64 `json:"added"`
+}
+
+// existsResponse is the structured JSON body for HEXISTS responses.
+type existsResponse struct {
+	Exists bool `json:"exists"`
+}
+
+// multiSetRequest is the JSON request body for multi-field HSET.
+type multiSetRequest struct {
+	Fields map[string]string `json:"fields"`
+}
+
+// incrByRequest is the JSON request body for HINCRBY.
+type incrByRequest struct {
+	Increment int64 `json:"increment"`
+}
+
+// incrByResponse is the structured JSON body for HINCRBY responses.
+type incrByResponse struct {
+	Value int64 `json:"value"`
+}
+
+// hgetallHandlerV1 returns every field/value pair in the hash (HGETALL).
+func (s *server) hgetallHandlerV1(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+
+	db, err := dbFromRequest(r)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	fields, err := s.clientForDB(db).HGetAll(r.Context(), key).Result()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	out := make(map[string]valueResponse, len(fields))
+	for field, value := range fields {
+		out[field] = toValueResponse([]byte(value))
+	}
+	writeJSON(w, http.StatusOK, hashFieldsResponse{Fields: out})
+}
+
+// hmsetHandlerV1 sets several hash fields in one request (multi-field HSET)
+// per the JSON request body {"fields": {"name": "value", ...}}.
+func (s *server) hmsetHandlerV1(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+
+	db, err := dbFromRequest(r)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	body, err := readBody(w, r, s.maxBodyBytes)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeJSONError(w, http.StatusRequestEntityTooLarge, "Request body too large")
+			return
+		}
+		writeJSONError(w, http.StatusBadRequest, "Failed to read body")
+		return
+	}
+
+	var req multiSetRequest
+	if err := json.Unmarshal(body, &req); err != nil || len(req.Fields) == 0 {
+		writeJSONError(w, http.StatusBadRequest, `Request body must be JSON: {"fields": {"name": "value"}}`)
+		return
+	}
+
+	args := make([]any, 0, len(req.Fields)*2)
+	for field, value := range req.Fields {
+		args = append(args, field, value)
+	}
+
+	added, err := s.clientForDB(db).HSet(r.Context(), key, args...).Result()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, addedResponse{Added: added})
+}
+
+// hkeysHandlerV1 returns every field name in the hash (HKEYS).
+func (s *server) hkeysHandlerV1(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+
+	db, err := dbFromRequest(r)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	keys, err := s.clientForDB(db).HKeys(r.Context(), key).Result()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, keysResponse{Keys: keys})
+}
+
+// hvalsHandlerV1 returns every field value in the hash, unordered relative to
+// field names (HVALS).
+func (s *server) hvalsHandlerV1(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+
+	db, err := dbFromRequest(r)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	values, err := s.clientForDB(db).HVals(r.Context(), key).Result()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, valuesResponse{Values: toValueResponses(values)})
+}
+
+// hmgetHandlerV1 returns the values of several fields (HMGET), given as a
+// comma-separated ?fields=a,b,c query parameter. The result preserves the
+// requested order, with null entries for fields that don't exist.
+func (s *server) hmgetHandlerV1(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+
+	db, err := dbFromRequest(r)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	fieldsParam := r.URL.Query().Get("fields")
+	if fieldsParam == "" {
+		writeJSONError(w, http.StatusBadRequest, "Missing required ?fields=a,b,c query parameter")
+		return
+	}
+	fields := strings.Split(fieldsParam, ",")
+
+	values, err := s.clientForDB(db).HMGet(r.Context(), key, fields...).Result()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	out := make([]*valueResponse, len(values))
+	for i, v := range values {
+		s, ok := v.(string)
+		if !ok {
+			continue // nil: field doesn't exist, leave as null
+		}
+		vr := toValueResponse([]byte(s))
+		out[i] = &vr
+	}
+	writeJSON(w, http.StatusOK, nullableValuesResponse{Values: out})
+}
+
+// hlenHandlerV1 returns the number of fields in the hash (0 for a missing
+// key, matching Redis HLEN semantics — no error).
+func (s *server) hlenHandlerV1(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+
+	db, err := dbFromRequest(r)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	length, err := s.clientForDB(db).HLen(r.Context(), key).Result()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, lengthResponse{Length: length})
+}
+
+// hexistsHandlerV1 reports whether a hash field exists (HEXISTS).
+func (s *server) hexistsHandlerV1(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+	field := r.PathValue("field")
+
+	db, err := dbFromRequest(r)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	exists, err := s.clientForDB(db).HExists(r.Context(), key, field).Result()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, existsResponse{Exists: exists})
+}
+
+// hincrbyHandlerV1 atomically increments (or decrements, for a negative
+// value) a hash field by the JSON request body {"increment": N} (HINCRBY),
+// creating the field (from 0) if it doesn't already exist.
+func (s *server) hincrbyHandlerV1(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+	field := r.PathValue("field")
+
+	db, err := dbFromRequest(r)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	body, err := readBody(w, r, s.maxBodyBytes)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeJSONError(w, http.StatusRequestEntityTooLarge, "Request body too large")
+			return
+		}
+		writeJSONError(w, http.StatusBadRequest, "Failed to read body")
+		return
+	}
+
+	var req incrByRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, `Request body must be JSON: {"increment": N}`)
+		return
+	}
+
+	value, err := s.clientForDB(db).HIncrBy(r.Context(), key, field, req.Increment).Result()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, incrByResponse{Value: value})
+}
+
+// lengthResponse is the structured JSON body for LLEN/LPUSH/RPUSH/HLEN
+// responses.
 type lengthResponse struct {
 	Length int64 `json:"length"`
 }
 
-// valuesResponse is the structured JSON body for LRANGE/LPOP/RPOP responses.
+// valuesResponse is the structured JSON body for LRANGE/LPOP/RPOP/HVALS
+// responses.
 type valuesResponse struct {
 	Values []valueResponse `json:"values"`
 }
@@ -526,9 +880,9 @@ func toValueResponses(values []string) []valueResponse {
 
 // listPushHandlerV1 returns a handler that LPUSHes or RPUSHes (per side) the
 // JSON-encoded values in the request body: {"values": ["a", "b"]}.
-func (s *server) listPushHandlerV1(side string) httprouter.Handle {
-	return func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-		key := ps.ByName("key")
+func (s *server) listPushHandlerV1(side string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		key := r.PathValue("key")
 
 		db, err := dbFromRequest(r)
 		if err != nil {
@@ -578,9 +932,9 @@ func (s *server) listPushHandlerV1(side string) httprouter.Handle {
 // `count` values (default 1, via the optional ?count= query parameter).
 // Reports 404 when the list is empty or missing, matching the string/hash GET
 // endpoints' "not found" behavior.
-func (s *server) listPopHandlerV1(side string) httprouter.Handle {
-	return func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-		key := ps.ByName("key")
+func (s *server) listPopHandlerV1(side string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		key := r.PathValue("key")
 
 		db, err := dbFromRequest(r)
 		if err != nil {
@@ -620,8 +974,8 @@ func (s *server) listPopHandlerV1(side string) httprouter.Handle {
 // listRangeHandlerV1 returns the elements of a list between the optional
 // ?start= and ?stop= query parameters (default 0 and -1, i.e. the whole
 // list), matching Redis LRANGE index semantics including negative indices.
-func (s *server) listRangeHandlerV1(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	key := ps.ByName("key")
+func (s *server) listRangeHandlerV1(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
 
 	db, err := dbFromRequest(r)
 	if err != nil {
@@ -658,8 +1012,8 @@ func (s *server) listRangeHandlerV1(w http.ResponseWriter, r *http.Request, ps h
 
 // listLenHandlerV1 returns a list's length (0 for a missing key, matching
 // Redis LLEN semantics — no error).
-func (s *server) listLenHandlerV1(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	key := ps.ByName("key")
+func (s *server) listLenHandlerV1(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
 
 	db, err := dbFromRequest(r)
 	if err != nil {
@@ -678,8 +1032,8 @@ func (s *server) listLenHandlerV1(w http.ResponseWriter, r *http.Request, ps htt
 
 // listIndexHandlerV1 returns the element at the given (possibly negative)
 // index, reporting 404 when the index is out of range or the key is missing.
-func (s *server) listIndexHandlerV1(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	key := ps.ByName("key")
+func (s *server) listIndexHandlerV1(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
 
 	db, err := dbFromRequest(r)
 	if err != nil {
@@ -687,7 +1041,7 @@ func (s *server) listIndexHandlerV1(w http.ResponseWriter, r *http.Request, ps h
 		return
 	}
 
-	index, err := strconv.ParseInt(ps.ByName("index"), 10, 64)
+	index, err := strconv.ParseInt(r.PathValue("index"), 10, 64)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, "Invalid index value")
 		return
@@ -708,8 +1062,8 @@ func (s *server) listIndexHandlerV1(w http.ResponseWriter, r *http.Request, ps h
 // listRemHandlerV1 removes occurrences of a value (LREM) per the JSON request
 // body {"value": "...", "count": N}. Always succeeds, even removing zero
 // elements, matching Redis LREM semantics (no error for a missing key).
-func (s *server) listRemHandlerV1(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	key := ps.ByName("key")
+func (s *server) listRemHandlerV1(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
 
 	db, err := dbFromRequest(r)
 	if err != nil {
@@ -745,7 +1099,7 @@ func (s *server) listRemHandlerV1(w http.ResponseWriter, r *http.Request, ps htt
 
 // notImplementedHandler responds 501 for namespaces reserved by the /v1
 // routing foundation but not yet implemented (generic key management: #5).
-func (s *server) notImplementedHandler(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+func (s *server) notImplementedHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSONError(w, http.StatusNotImplemented, "Not implemented yet")
 }
 
@@ -759,10 +1113,20 @@ func (s *server) healthHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, "OK")
 }
 
-// handler builds the HTTP handler. A ServeMux fronts two separate httprouter
-// trees — the deprecated flat routes and the /v1 namespaced routes — so a
-// static "/v1" segment never has to coexist with a wildcard at the same tree
-// level, and /health can coexist with both.
+// handler builds the HTTP handler. The deprecated flat routes are served
+// from an httprouter tree; /v1 is served from a native ServeMux (Go 1.22+
+// path wildcards).
+//
+// Bulk/multi-item operations (MSET/MGET, HGETALL/HKEYS/HVALS/HMGET/HLEN/
+// multi-field HSET) live under their own plural namespace ("/v1/strings",
+// "/v1/hashes") rather than as literal siblings of a {key}/{field} wildcard
+// in the singular one ("/v1/string", "/v1/hash"). This is deliberate: a
+// sibling literal like "keys" would take routing precedence over the
+// wildcard for that exact path, silently shadowing any real key or field
+// that happened to be named "keys". Giving bulk operations a separate tree
+// with no competing wildcard makes that shadowing structurally impossible,
+// not just unlikely, and keeps every command's path unambiguous regardless
+// of what data actually exists.
 func (s *server) handler() http.Handler {
 	legacy := httprouter.New()
 	legacy.POST("/:key", s.withAuth(s.setHandler))
@@ -774,29 +1138,50 @@ func (s *server) handler() http.Handler {
 	legacy.GET("/:key/:field", s.withAuth(s.hgetHandler))
 	legacy.DELETE("/:key/:field", s.withAuth(s.hdelHandler))
 
-	v1 := httprouter.New()
-	v1.POST("/v1/string/:key", s.withAuth(s.setHandlerV1))
-	v1.GET("/v1/string/:key", s.withAuth(s.getHandlerV1))
-	v1.DELETE("/v1/string/:key", s.withAuth(s.deleteHandlerV1))
+	v1 := http.NewServeMux()
 
-	v1.POST("/v1/hash/:key/:field", s.withAuth(s.hsetHandlerV1))
-	v1.GET("/v1/hash/:key/:field", s.withAuth(s.hgetHandlerV1))
-	v1.DELETE("/v1/hash/:key/:field", s.withAuth(s.hdelHandlerV1))
+	v1.HandleFunc("POST /v1/string/{key}", s.withAuthFunc(s.setHandlerV1))
+	v1.HandleFunc("GET /v1/string/{key}", s.withAuthFunc(s.getHandlerV1))
+	v1.HandleFunc("DELETE /v1/string/{key}", s.withAuthFunc(s.deleteHandlerV1))
+
+	// Strings: multi-key operations (MSET/MGET) live under the plural
+	// "/v1/strings" namespace — a tree with no {key} wildcard at all — so a
+	// real key can never be shadowed by these, unlike a same-tree literal
+	// sibling would risk.
+	v1.HandleFunc("POST /v1/strings", s.withAuthFunc(s.msetHandlerV1))
+	v1.HandleFunc("GET /v1/strings", s.withAuthFunc(s.mgetHandlerV1))
+
+	// Hash: single-field operations (HSET/HGET/HDEL/HEXISTS/HINCRBY).
+	v1.HandleFunc("POST /v1/hash/{key}/{field}", s.withAuthFunc(s.hsetHandlerV1))
+	v1.HandleFunc("GET /v1/hash/{key}/{field}", s.withAuthFunc(s.hgetHandlerV1))
+	v1.HandleFunc("DELETE /v1/hash/{key}/{field}", s.withAuthFunc(s.hdelHandlerV1))
+	v1.HandleFunc("GET /v1/hash/{key}/{field}/exists", s.withAuthFunc(s.hexistsHandlerV1))
+	v1.HandleFunc("POST /v1/hash/{key}/{field}/incrby", s.withAuthFunc(s.hincrbyHandlerV1))
+
+	// Hashes: whole-hash and multi-field operations, under the plural
+	// "/v1/hashes" namespace — a separate tree from "/v1/hash", so a hash
+	// field can never be shadowed by e.g. a field literally named "keys".
+	v1.HandleFunc("GET /v1/hashes/{key}", s.withAuthFunc(s.hgetallHandlerV1))
+	v1.HandleFunc("POST /v1/hashes/{key}", s.withAuthFunc(s.hmsetHandlerV1))
+	v1.HandleFunc("GET /v1/hashes/{key}/keys", s.withAuthFunc(s.hkeysHandlerV1))
+	v1.HandleFunc("GET /v1/hashes/{key}/values", s.withAuthFunc(s.hvalsHandlerV1))
+	v1.HandleFunc("GET /v1/hashes/{key}/mget", s.withAuthFunc(s.hmgetHandlerV1))
+	v1.HandleFunc("GET /v1/hashes/{key}/len", s.withAuthFunc(s.hlenHandlerV1))
 
 	// List operations (LPUSH/RPUSH/LPOP/RPOP/LRANGE/LLEN/LREM/LINDEX).
-	v1.GET("/v1/list/:key", s.withAuth(s.listRangeHandlerV1))
-	v1.DELETE("/v1/list/:key", s.withAuth(s.listRemHandlerV1))
-	v1.GET("/v1/list/:key/len", s.withAuth(s.listLenHandlerV1))
-	v1.GET("/v1/list/:key/index/:index", s.withAuth(s.listIndexHandlerV1))
-	v1.POST("/v1/list/:key/left", s.withAuth(s.listPushHandlerV1("left")))
-	v1.POST("/v1/list/:key/right", s.withAuth(s.listPushHandlerV1("right")))
-	v1.DELETE("/v1/list/:key/left", s.withAuth(s.listPopHandlerV1("left")))
-	v1.DELETE("/v1/list/:key/right", s.withAuth(s.listPopHandlerV1("right")))
+	v1.HandleFunc("GET /v1/list/{key}", s.withAuthFunc(s.listRangeHandlerV1))
+	v1.HandleFunc("DELETE /v1/list/{key}", s.withAuthFunc(s.listRemHandlerV1))
+	v1.HandleFunc("GET /v1/list/{key}/len", s.withAuthFunc(s.listLenHandlerV1))
+	v1.HandleFunc("GET /v1/list/{key}/index/{index}", s.withAuthFunc(s.listIndexHandlerV1))
+	v1.HandleFunc("POST /v1/list/{key}/left", s.withAuthFunc(s.listPushHandlerV1("left")))
+	v1.HandleFunc("POST /v1/list/{key}/right", s.withAuthFunc(s.listPushHandlerV1("right")))
+	v1.HandleFunc("DELETE /v1/list/{key}/left", s.withAuthFunc(s.listPopHandlerV1("left")))
+	v1.HandleFunc("DELETE /v1/list/{key}/right", s.withAuthFunc(s.listPopHandlerV1("right")))
 
 	// Namespace reserved for #5 (generic key management) — respond 501 until
 	// implemented.
 	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodDelete} {
-		v1.Handle(method, "/v1/keys/:key", s.withAuth(s.notImplementedHandler))
+		v1.HandleFunc(method+" /v1/keys/{key}", s.withAuthFunc(s.notImplementedHandler))
 	}
 
 	mux := http.NewServeMux()

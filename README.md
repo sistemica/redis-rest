@@ -54,7 +54,19 @@ By default all `/v1` requests use logical database `0`. Send an
 curl -H "X-Redis-DB: 2" "http://localhost:8081/v1/string/mykey"
 ```
 
+### **Naming convention: singular vs. plural**
+
+Throughout `/v1`, a **singular** type name (`string`, `hash`) addresses one
+specific key/field by path parameter; a **plural** name (`strings`, `hashes`)
+addresses bulk/multi-item operations that don't fit that per-item shape.
+These are kept as fully separate route trees on purpose: a plural-namespace
+operation name can never collide with — or shadow — a real key or field name,
+because there is no shared path position between the two trees for it to
+collide at.
+
 ### **String endpoints**
+
+Single-key operations:
 
 | Method | Path | Redis command |
 |--------|------|----------------|
@@ -70,18 +82,72 @@ curl -X DELETE "http://localhost:8081/v1/string/mykey"
 # {"status":"ok"}
 ```
 
+Multi-key operations, under `/v1/strings` (plural — a key literally named
+`mset` or `mget` is unaffected; it's still reachable at `/v1/string/mset`):
+
+| Method | Path | Redis command |
+|--------|------|----------------|
+| `POST` | `/v1/strings` | `MSET` |
+| `GET` | `/v1/strings?keys=a,b,c` | `MGET` |
+
+`MGET` returns a `values` array in the requested key order, with `null`
+entries for keys that don't exist — same shape as hash `HMGET` below.
+
+```bash
+curl -X POST "http://localhost:8081/v1/strings" -d '{"values": {"a": "1", "b": "2"}}'
+# {"status":"ok"}
+curl "http://localhost:8081/v1/strings?keys=a,missing,b"
+# {"values":[{"value":"1"},null,{"value":"2"}]}
+```
+
 ### **Hash endpoints**
+
+Single-field operations, under `/v1/hash`:
 
 | Method | Path | Redis command |
 |--------|------|----------------|
 | `POST` | `/v1/hash/:key/:field` | `HSET` |
 | `GET` | `/v1/hash/:key/:field` | `HGET` |
 | `DELETE` | `/v1/hash/:key/:field` | `HDEL` |
+| `GET` | `/v1/hash/:key/:field/exists` | `HEXISTS` |
+| `POST` | `/v1/hash/:key/:field/incrby` | `HINCRBY` |
 
 ```bash
 curl -X POST "http://localhost:8081/v1/hash/user1/name" -d "Elvis"
 curl "http://localhost:8081/v1/hash/user1/name"
 # {"value":"Elvis"}
+curl "http://localhost:8081/v1/hash/user1/name/exists"
+# {"exists":true}
+curl -X POST "http://localhost:8081/v1/hash/counters/views/incrby" -d '{"increment": 5}'
+# {"value":5}
+```
+
+Whole-hash and multi-field operations, under `/v1/hashes` (plural — a field
+literally named `keys` or `values` is unaffected; it's still reachable at
+`/v1/hash/:key/keys` via ordinary `HGET`):
+
+| Method | Path | Redis command |
+|--------|------|----------------|
+| `GET` | `/v1/hashes/:key` | `HGETALL` |
+| `POST` | `/v1/hashes/:key` | multi-field `HSET` |
+| `GET` | `/v1/hashes/:key/keys` | `HKEYS` |
+| `GET` | `/v1/hashes/:key/values` | `HVALS` |
+| `GET` | `/v1/hashes/:key/mget?fields=a,b,c` | `HMGET` |
+| `GET` | `/v1/hashes/:key/len` | `HLEN` |
+
+`HGETALL` returns a JSON object of field → value envelope; `HMGET` returns a
+`values` array in the requested field order, with `null` entries for fields
+that don't exist. `HGETALL`/`HKEYS`/`HVALS`/`HLEN` return an empty/zero result
+for a missing key rather than an error, matching Redis's own semantics for
+those commands.
+
+```bash
+curl -X POST "http://localhost:8081/v1/hashes/user1" -d '{"fields": {"name": "Elvis", "last_name": "Presley"}}'
+# {"added":2}
+curl "http://localhost:8081/v1/hashes/user1"
+# {"fields":{"name":{"value":"Elvis"},"last_name":{"value":"Presley"}}}
+curl "http://localhost:8081/v1/hashes/user1/mget?fields=name,missing"
+# {"values":[{"value":"Elvis"},null]}
 ```
 
 ### **List endpoints**

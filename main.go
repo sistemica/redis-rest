@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/base64"
@@ -1103,6 +1104,145 @@ func (s *server) notImplementedHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSONError(w, http.StatusNotImplemented, "Not implemented yet")
 }
 
+// maxPipelineItems bounds a single /v1/pipeline request to keep worst-case
+// latency and memory bounded; the overall request body is already bounded by
+// maxBodyBytes.
+const maxPipelineItems = 100
+
+// pipelineItem is one element of a /v1/pipeline request body: an HTTP method
+// and path matching any other /v1 route, plus an optional body — exactly as
+// if the client had made that request directly. Body may be a JSON string
+// (used verbatim as the raw request body, matching the SET/HSET-style
+// endpoints) or a JSON object/array (re-encoded and used as-is, matching the
+// JSON-body endpoints like LPUSH/LREM/HINCRBY/multi-HSET/MSET).
+type pipelineItem struct {
+	Method string          `json:"method"`
+	Path   string          `json:"path"`
+	Body   json.RawMessage `json:"body,omitempty"`
+}
+
+// pipelineResultItem is the response counterpart to pipelineItem: the status
+// and JSON body the underlying route would have returned to a direct caller.
+type pipelineResultItem struct {
+	Status int             `json:"status"`
+	Body   json.RawMessage `json:"body"`
+}
+
+// pipelineResponse is the structured JSON body for /v1/pipeline responses.
+type pipelineResponse struct {
+	Results []pipelineResultItem `json:"results"`
+}
+
+// responseCapture is a minimal http.ResponseWriter that records a response
+// instead of writing it to a network connection, used by pipelineHandlerV1 to
+// run a /v1 route internally without a real request/response round trip.
+type responseCapture struct {
+	status int
+	body   bytes.Buffer
+	header http.Header
+}
+
+func newResponseCapture() *responseCapture {
+	return &responseCapture{status: http.StatusOK, header: make(http.Header)}
+}
+
+func (rc *responseCapture) Header() http.Header         { return rc.header }
+func (rc *responseCapture) Write(b []byte) (int, error) { return rc.body.Write(b) }
+func (rc *responseCapture) WriteHeader(status int)      { rc.status = status }
+
+func pipelineErrorResult(status int, msg string) pipelineResultItem {
+	b, _ := json.Marshal(errorResponse{Error: msg})
+	return pipelineResultItem{Status: status, Body: b}
+}
+
+// pipelineHandlerV1 executes an ordered list of /v1 requests in one HTTP
+// call, avoiding a per-command round trip (#7). Each item runs independently
+// and sequentially in request order — this is deliberately NOT a
+// transaction: there is no atomicity or isolation. If item 3 of 5 fails,
+// items 1-2 already took effect and are not rolled back, and other clients'
+// commands may interleave between items. An invalid item (bad method, a path
+// outside /v1, or /v1/pipeline itself) produces a per-item 400 result rather
+// than failing the whole batch.
+func (s *server) pipelineHandlerV1(w http.ResponseWriter, r *http.Request) {
+	body, err := readBody(w, r, s.maxBodyBytes)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeJSONError(w, http.StatusRequestEntityTooLarge, "Request body too large")
+			return
+		}
+		writeJSONError(w, http.StatusBadRequest, "Failed to read body")
+		return
+	}
+
+	var items []pipelineItem
+	if err := json.Unmarshal(body, &items); err != nil {
+		writeJSONError(w, http.StatusBadRequest, `Request body must be a JSON array: [{"method": "...", "path": "...", "body": ...}]`)
+		return
+	}
+	if len(items) == 0 {
+		writeJSONError(w, http.StatusBadRequest, "Pipeline must contain at least one item")
+		return
+	}
+	if len(items) > maxPipelineItems {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("Pipeline exceeds the %d item limit", maxPipelineItems))
+		return
+	}
+
+	v1 := s.v1Mux()
+	results := make([]pipelineResultItem, len(items))
+	for i, item := range items {
+		results[i] = s.runPipelineItem(v1, r, item)
+	}
+
+	writeJSON(w, http.StatusOK, pipelineResponse{Results: results})
+}
+
+// runPipelineItem validates and dispatches a single pipeline item through the
+// v1 mux, forwarding the outer request's auth and DB-selection headers (but
+// not its Accept header — pipeline item results are always the standard JSON
+// envelope, never raw octet-stream), and captures the resulting status and
+// body.
+func (s *server) runPipelineItem(v1 *http.ServeMux, outer *http.Request, item pipelineItem) pipelineResultItem {
+	method := strings.ToUpper(item.Method)
+	switch method {
+	case http.MethodGet, http.MethodPost, http.MethodDelete:
+	default:
+		return pipelineErrorResult(http.StatusBadRequest, fmt.Sprintf("Unsupported method %q", item.Method))
+	}
+	if !strings.HasPrefix(item.Path, "/v1/") || item.Path == "/v1/pipeline" {
+		return pipelineErrorResult(http.StatusBadRequest, fmt.Sprintf("Invalid path %q: must be a /v1/... route other than /v1/pipeline", item.Path))
+	}
+
+	var reqBody io.Reader
+	if len(item.Body) > 0 && string(item.Body) != "null" {
+		var raw string
+		if err := json.Unmarshal(item.Body, &raw); err == nil {
+			reqBody = strings.NewReader(raw)
+		} else {
+			reqBody = bytes.NewReader(item.Body)
+		}
+	}
+
+	subReq, err := http.NewRequestWithContext(outer.Context(), method, item.Path, reqBody)
+	if err != nil {
+		return pipelineErrorResult(http.StatusBadRequest, fmt.Sprintf("Invalid path %q: %v", item.Path, err))
+	}
+	subReq.Header.Set("Authorization", outer.Header.Get("Authorization"))
+	if db := outer.Header.Get(dbHeader); db != "" {
+		subReq.Header.Set(dbHeader, db)
+	}
+
+	rc := newResponseCapture()
+	v1.ServeHTTP(rc, subReq)
+
+	respBody := rc.body.Bytes()
+	if len(respBody) == 0 {
+		respBody = []byte("null")
+	}
+	return pipelineResultItem{Status: rc.status, Body: respBody}
+}
+
 // healthHandler reports service readiness by pinging Redis.
 func (s *server) healthHandler(w http.ResponseWriter, r *http.Request) {
 	if err := s.rdb.Ping(r.Context()).Err(); err != nil {
@@ -1113,9 +1253,7 @@ func (s *server) healthHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, "OK")
 }
 
-// handler builds the HTTP handler. The deprecated flat routes are served
-// from an httprouter tree; /v1 is served from a native ServeMux (Go 1.22+
-// path wildcards).
+// v1Mux builds the /v1 ServeMux (Go 1.22+ path wildcards).
 //
 // Bulk/multi-item operations (MSET/MGET, HGETALL/HKEYS/HVALS/HMGET/HLEN/
 // multi-field HSET) live under their own plural namespace ("/v1/strings",
@@ -1127,17 +1265,12 @@ func (s *server) healthHandler(w http.ResponseWriter, r *http.Request) {
 // with no competing wildcard makes that shadowing structurally impossible,
 // not just unlikely, and keeps every command's path unambiguous regardless
 // of what data actually exists.
-func (s *server) handler() http.Handler {
-	legacy := httprouter.New()
-	legacy.POST("/:key", s.withAuth(s.setHandler))
-	legacy.GET("/:key", s.withAuth(s.getHandler))
-	legacy.DELETE("/:key", s.withAuth(s.deleteHandler))
-
-	// Hash field operations (HSET/HGET/HDEL).
-	legacy.POST("/:key/:field", s.withAuth(s.hsetHandler))
-	legacy.GET("/:key/:field", s.withAuth(s.hgetHandler))
-	legacy.DELETE("/:key/:field", s.withAuth(s.hdelHandler))
-
+//
+// Also used directly by pipelineHandlerV1 (see below) to dispatch each
+// batched item through the exact same routing and auth logic a top-level
+// request would go through — a fresh instance per pipeline call, same as
+// handler() itself rebuilds its trees per call.
+func (s *server) v1Mux() *http.ServeMux {
 	v1 := http.NewServeMux()
 
 	v1.HandleFunc("POST /v1/string/{key}", s.withAuthFunc(s.setHandlerV1))
@@ -1178,15 +1311,34 @@ func (s *server) handler() http.Handler {
 	v1.HandleFunc("DELETE /v1/list/{key}/left", s.withAuthFunc(s.listPopHandlerV1("left")))
 	v1.HandleFunc("DELETE /v1/list/{key}/right", s.withAuthFunc(s.listPopHandlerV1("right")))
 
+	// Batch endpoint: run several /v1 requests in one HTTP call (#7).
+	v1.HandleFunc("POST /v1/pipeline", s.withAuthFunc(s.pipelineHandlerV1))
+
 	// Namespace reserved for #5 (generic key management) — respond 501 until
 	// implemented.
 	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodDelete} {
 		v1.HandleFunc(method+" /v1/keys/{key}", s.withAuthFunc(s.notImplementedHandler))
 	}
 
+	return v1
+}
+
+// handler builds the HTTP handler. The deprecated flat routes are served
+// from an httprouter tree; /v1 is served from v1Mux's native ServeMux.
+func (s *server) handler() http.Handler {
+	legacy := httprouter.New()
+	legacy.POST("/:key", s.withAuth(s.setHandler))
+	legacy.GET("/:key", s.withAuth(s.getHandler))
+	legacy.DELETE("/:key", s.withAuth(s.deleteHandler))
+
+	// Hash field operations (HSET/HGET/HDEL).
+	legacy.POST("/:key/:field", s.withAuth(s.hsetHandler))
+	legacy.GET("/:key/:field", s.withAuth(s.hgetHandler))
+	legacy.DELETE("/:key/:field", s.withAuth(s.hdelHandler))
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", s.healthHandler)
-	mux.Handle("/v1/", v1)
+	mux.Handle("/v1/", s.v1Mux())
 	mux.Handle("/", legacy)
 	return mux
 }

@@ -295,6 +295,36 @@ req GET /v1/string/mset
 check_status "GET /v1/string/mset (real key, not batch) is 200" 200
 check_json_field "key named mset is unaffected by the batch endpoint" '.value' "a real key literally named mset"
 
+echo "-- v1 pipeline: batched, mixed, non-transactional commands (issue #7)"
+req POST /v1/pipeline -d '[
+  {"method": "POST", "path": "/v1/string/pk", "body": "hello"},
+  {"method": "GET", "path": "/v1/string/pk"},
+  {"method": "GET", "path": "/v1/string/pk-missing"},
+  {"method": "POST", "path": "/v1/hash/puser/name", "body": "Elvis"},
+  {"method": "POST", "path": "/v1/list/plist/left", "body": {"values": ["a", "b"]}}
+]'
+check_status "pipeline (5 mixed items) is 200" 200
+check_json_field "pipeline item0 (SET) status is 200" '.results[0].status' "200"
+check_json_field "pipeline item1 (GET pk) status is 200" '.results[1].status' "200"
+check_json_field "pipeline item1 (GET pk) value is hello" '.results[1].body.value' "hello"
+check_json_field "pipeline item2 (GET missing) status is 404 (no abort)" '.results[2].status' "404"
+check_json_field "pipeline item3 (HSET) status is 200" '.results[3].status' "200"
+check_json_field "pipeline item4 (LPUSH) status is 200" '.results[4].status' "200"
+check_json_field "pipeline item4 (LPUSH) length is 2" '.results[4].body.length' "2"
+req GET /v1/hash/puser/name
+check_json_field "pipeline HSET actually persisted" '.value' "Elvis"
+
+req POST /v1/pipeline -d '[{"method": "PATCH", "path": "/v1/string/pk"}]'
+check_status "pipeline with invalid item method is 200 (per-item error)" 200
+check_json_field "pipeline invalid method item status is 400" '.results[0].status' "400"
+
+req POST /v1/pipeline -d '[{"method": "GET", "path": "/legacykey"}]'
+check_status "pipeline with non-/v1 path is 200 (per-item error)" 200
+check_json_field "pipeline non-/v1 path item status is 400" '.results[0].status' "400"
+
+req POST /v1/pipeline -d '[]'
+check_status "pipeline with empty array is 400" 400
+
 echo "-- legacy routes still work alongside /v1"
 req POST /legacykey --data-binary "legacy-value"
 check_status "POST /legacykey (legacy) is 200" 200

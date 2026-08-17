@@ -38,7 +38,7 @@ introduces an explicit, versioned namespace and structured responses.
 ### Complete the existing types
 
 - [ ] **Strings:** `INCR`, `DECR`, `INCRBY`, `DECRBY`, `APPEND`, `SETNX`,
-      `GETSET`, `MGET`, `MSET`, `GETEX`
+      `GETSET`, `GETEX` — `MGET`/`MSET` done (`/v1/strings`)
 - [x] **Hashes:** `HGETALL`, `HKEYS`, `HVALS`, `HMGET`, multi-field `HSET`,
       `HEXISTS`, `HLEN`, `HINCRBY`
 

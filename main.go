@@ -423,6 +423,85 @@ func (s *server) deleteHandlerV1(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, statusResponse{Status: "ok"})
 }
 
+// msetRequest is the JSON request body for MSET.
+type msetRequest struct {
+	Values map[string]string `json:"values"`
+}
+
+// msetHandlerV1 sets several string keys atomically (MSET) per the JSON
+// request body {"values": {"key1": "value1", ...}}.
+func (s *server) msetHandlerV1(w http.ResponseWriter, r *http.Request) {
+	db, err := dbFromRequest(r)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	body, err := readBody(w, r, s.maxBodyBytes)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeJSONError(w, http.StatusRequestEntityTooLarge, "Request body too large")
+			return
+		}
+		writeJSONError(w, http.StatusBadRequest, "Failed to read body")
+		return
+	}
+
+	var req msetRequest
+	if err := json.Unmarshal(body, &req); err != nil || len(req.Values) == 0 {
+		writeJSONError(w, http.StatusBadRequest, `Request body must be JSON: {"values": {"key": "value"}}`)
+		return
+	}
+
+	args := make([]any, 0, len(req.Values)*2)
+	for key, value := range req.Values {
+		args = append(args, key, value)
+	}
+
+	if err := s.clientForDB(db).MSet(r.Context(), args...).Err(); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, statusResponse{Status: "ok"})
+}
+
+// mgetHandlerV1 returns the values of several string keys (MGET), given as a
+// comma-separated ?keys=a,b,c query parameter. The result preserves the
+// requested order, with null entries for keys that don't exist.
+func (s *server) mgetHandlerV1(w http.ResponseWriter, r *http.Request) {
+	db, err := dbFromRequest(r)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	keysParam := r.URL.Query().Get("keys")
+	if keysParam == "" {
+		writeJSONError(w, http.StatusBadRequest, "Missing required ?keys=a,b,c query parameter")
+		return
+	}
+	keys := strings.Split(keysParam, ",")
+
+	values, err := s.clientForDB(db).MGet(r.Context(), keys...).Result()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	out := make([]*valueResponse, len(values))
+	for i, v := range values {
+		str, ok := v.(string)
+		if !ok {
+			continue // nil: key doesn't exist, leave as null
+		}
+		vr := toValueResponse([]byte(str))
+		out[i] = &vr
+	}
+	writeJSON(w, http.StatusOK, nullableValuesResponse{Values: out})
+}
+
 // hsetHandlerV1 stores the raw request body as a hash field's value (HSET).
 func (s *server) hsetHandlerV1(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
@@ -1034,13 +1113,20 @@ func (s *server) healthHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, "OK")
 }
 
-// handler builds the HTTP handler. The deprecated flat routes are served from
-// an httprouter tree; /v1 is served from a native ServeMux (Go 1.22+ path
-// wildcards), whose specificity-based matching lets literal segments like
-// "keys" or "len" coexist with a wildcard sibling such as {field} at the same
-// path position — something httprouter's tree flatly refuses to register.
-// This gives every /v1 command its own clean, dedicated path with no
-// breaking changes to routes already shipped.
+// handler builds the HTTP handler. The deprecated flat routes are served
+// from an httprouter tree; /v1 is served from a native ServeMux (Go 1.22+
+// path wildcards).
+//
+// Bulk/multi-item operations (MSET/MGET, HGETALL/HKEYS/HVALS/HMGET/HLEN/
+// multi-field HSET) live under their own plural namespace ("/v1/strings",
+// "/v1/hashes") rather than as literal siblings of a {key}/{field} wildcard
+// in the singular one ("/v1/string", "/v1/hash"). This is deliberate: a
+// sibling literal like "keys" would take routing precedence over the
+// wildcard for that exact path, silently shadowing any real key or field
+// that happened to be named "keys". Giving bulk operations a separate tree
+// with no competing wildcard makes that shadowing structurally impossible,
+// not just unlikely, and keeps every command's path unambiguous regardless
+// of what data actually exists.
 func (s *server) handler() http.Handler {
 	legacy := httprouter.New()
 	legacy.POST("/:key", s.withAuth(s.setHandler))
@@ -1058,13 +1144,12 @@ func (s *server) handler() http.Handler {
 	v1.HandleFunc("GET /v1/string/{key}", s.withAuthFunc(s.getHandlerV1))
 	v1.HandleFunc("DELETE /v1/string/{key}", s.withAuthFunc(s.deleteHandlerV1))
 
-	// Hash: whole-hash and multi-field operations.
-	v1.HandleFunc("GET /v1/hash/{key}", s.withAuthFunc(s.hgetallHandlerV1))
-	v1.HandleFunc("POST /v1/hash/{key}/fields", s.withAuthFunc(s.hmsetHandlerV1))
-	v1.HandleFunc("GET /v1/hash/{key}/keys", s.withAuthFunc(s.hkeysHandlerV1))
-	v1.HandleFunc("GET /v1/hash/{key}/values", s.withAuthFunc(s.hvalsHandlerV1))
-	v1.HandleFunc("GET /v1/hash/{key}/mget", s.withAuthFunc(s.hmgetHandlerV1))
-	v1.HandleFunc("GET /v1/hash/{key}/len", s.withAuthFunc(s.hlenHandlerV1))
+	// Strings: multi-key operations (MSET/MGET) live under the plural
+	// "/v1/strings" namespace — a tree with no {key} wildcard at all — so a
+	// real key can never be shadowed by these, unlike a same-tree literal
+	// sibling would risk.
+	v1.HandleFunc("POST /v1/strings", s.withAuthFunc(s.msetHandlerV1))
+	v1.HandleFunc("GET /v1/strings", s.withAuthFunc(s.mgetHandlerV1))
 
 	// Hash: single-field operations (HSET/HGET/HDEL/HEXISTS/HINCRBY).
 	v1.HandleFunc("POST /v1/hash/{key}/{field}", s.withAuthFunc(s.hsetHandlerV1))
@@ -1072,6 +1157,16 @@ func (s *server) handler() http.Handler {
 	v1.HandleFunc("DELETE /v1/hash/{key}/{field}", s.withAuthFunc(s.hdelHandlerV1))
 	v1.HandleFunc("GET /v1/hash/{key}/{field}/exists", s.withAuthFunc(s.hexistsHandlerV1))
 	v1.HandleFunc("POST /v1/hash/{key}/{field}/incrby", s.withAuthFunc(s.hincrbyHandlerV1))
+
+	// Hashes: whole-hash and multi-field operations, under the plural
+	// "/v1/hashes" namespace — a separate tree from "/v1/hash", so a hash
+	// field can never be shadowed by e.g. a field literally named "keys".
+	v1.HandleFunc("GET /v1/hashes/{key}", s.withAuthFunc(s.hgetallHandlerV1))
+	v1.HandleFunc("POST /v1/hashes/{key}", s.withAuthFunc(s.hmsetHandlerV1))
+	v1.HandleFunc("GET /v1/hashes/{key}/keys", s.withAuthFunc(s.hkeysHandlerV1))
+	v1.HandleFunc("GET /v1/hashes/{key}/values", s.withAuthFunc(s.hvalsHandlerV1))
+	v1.HandleFunc("GET /v1/hashes/{key}/mget", s.withAuthFunc(s.hmgetHandlerV1))
+	v1.HandleFunc("GET /v1/hashes/{key}/len", s.withAuthFunc(s.hlenHandlerV1))
 
 	// List operations (LPUSH/RPUSH/LPOP/RPOP/LRANGE/LLEN/LREM/LINDEX).
 	v1.HandleFunc("GET /v1/list/{key}", s.withAuthFunc(s.listRangeHandlerV1))
